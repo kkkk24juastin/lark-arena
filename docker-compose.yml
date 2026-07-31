@@ -18,7 +18,4 @@ services:
       - LARK_ARENA_DB_PATH=/data/arena.redb
       - RUST_LOG=lark_arena=info,tower_http=info
     volumes:
-      - lark-arena-data:/data
-
-volumes:
-  lark-arena-data:
+      - ./data:/data
