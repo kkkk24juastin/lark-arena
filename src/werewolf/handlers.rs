@@ -47,7 +47,8 @@ impl Bot {
             vec![
                 markdown(
                     "**操作方式**：先在大厅 [加入] 进房，然后点 [开始狼人杀] 按钮，\
-                     或 `/wolf start`。人数不足时可点 [AI 补齐人数] 一键补到 9 人。\n\n\
+                     或 `/wolf start`。可用 [加入 AI] 逐个加到 12 人，人数不足时也可点\
+                     [AI 补齐人数] 一键补到 9 人；[移除 AI] 每次移除一名。\n\n\
                      • `wolf join` 加入房间\n\
                      • `wolf leave` 离开房间\n\
                      • `wolf start` 开狼人杀（9-12 名玩家）\n\

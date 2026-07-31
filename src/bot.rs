@@ -195,38 +195,60 @@ impl Bot {
         self.refresh_lobby(chat_id).await
     }
 
-    async fn fill_ai_lobby(&self, chat_id: &str) -> Result<()> {
-        if self.llm.is_none() {
-            return Err(anyhow!("机器人未配置 OPENAI_API_KEY，暂时无法使用 AI 补齐"));
-        }
+    async fn add_ai_lobby(&self, chat_id: &str) -> Result<()> {
+        self.require_ai_enabled()?;
         {
             let mut games = self.wolf_games.lock();
             let game = games
                 .entry(chat_id.to_string())
                 .or_insert_with(|| WolfGame::new(chat_id.to_string()));
-            if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
-                return Err(anyhow!("狼人杀已经开始"));
-            }
-            let mut next = game
-                .players
-                .iter()
-                .filter_map(|p| p.open_id.strip_prefix("ai:"))
-                .filter_map(|n| n.parse::<u32>().ok())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            for _ in 0..ai_seats_needed(game.players.len()) {
-                let persona = Persona::random();
-                game.add_ai_player(
-                    format!("ai:{next}"),
-                    format!("{} #{}", persona.label(), game.players.len() + 1),
-                    persona,
-                )?;
-                next += 1;
-            }
+            add_ai_players(game, 1)?;
             self.persist_wolf_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
+    }
+
+    async fn fill_ai_lobby(&self, chat_id: &str) -> Result<()> {
+        self.require_ai_enabled()?;
+        {
+            let mut games = self.wolf_games.lock();
+            let game = games
+                .entry(chat_id.to_string())
+                .or_insert_with(|| WolfGame::new(chat_id.to_string()));
+            let seats_needed = ai_seats_needed(game.players.len());
+            add_ai_players(game, seats_needed)?;
+            self.persist_wolf_locked(chat_id, game);
+        }
+        self.refresh_lobby(chat_id).await
+    }
+
+    async fn remove_ai_lobby(&self, chat_id: &str) -> Result<()> {
+        {
+            let mut games = self.wolf_games.lock();
+            let game = games
+                .get_mut(chat_id)
+                .ok_or_else(|| anyhow!("当前没有狼人杀房间"))?;
+            if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
+                return Err(anyhow!("狼人杀已经开始"));
+            }
+            let idx = game
+                .players
+                .iter()
+                .rposition(|player| player.is_ai)
+                .ok_or_else(|| anyhow!("当前没有 AI 玩家"))?;
+            game.players.remove(idx);
+            self.persist_wolf_locked(chat_id, game);
+        }
+        self.refresh_lobby(chat_id).await
+    }
+
+    fn require_ai_enabled(&self) -> Result<()> {
+        if self.llm.is_none() {
+            return Err(anyhow!(
+                "机器人未配置 OPENAI_API_KEY，暂时无法使用 AI 玩家"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn do_reset(&self, chat_id: &str) -> Result<()> {
@@ -301,7 +323,10 @@ impl Bot {
             let Some(game) = games.get(chat_id) else {
                 return Ok(());
             };
-            (build_lobby_card(game), game.lobby_msg_id.clone())
+            (
+                build_lobby_card(game, self.llm.is_some()),
+                game.lobby_msg_id.clone(),
+            )
         };
         if let Some(id) = old_id {
             if self.client.update_card(&id, &value).await.is_ok() {
@@ -353,7 +378,9 @@ impl Bot {
                     bot.do_join(&chat_id, &oid, &name).await
                 }
                 "leave_lobby" => bot.do_leave(&chat_id, &oid).await,
+                "add_ai_lobby" => bot.add_ai_lobby(&chat_id).await,
                 "fill_ai_lobby" => bot.fill_ai_lobby(&chat_id).await,
+                "remove_ai_lobby" => bot.remove_ai_lobby(&chat_id).await,
                 "start_wolf_lobby" => bot.do_start_wolf(&chat_id).await,
                 "reset_lobby" => bot.do_reset(&chat_id).await,
                 _ => Ok(()),
@@ -438,8 +465,10 @@ impl Bot {
             let games = self.wolf_games.lock();
             games
                 .get(chat_id)
-                .map(build_lobby_card)
-                .unwrap_or_else(|| build_lobby_card(&WolfGame::new(chat_id.to_string())))
+                .map(|game| build_lobby_card(game, self.llm.is_some()))
+                .unwrap_or_else(|| {
+                    build_lobby_card(&WolfGame::new(chat_id.to_string()), self.llm.is_some())
+                })
         };
         self.client
             .send_ephemeral_card(chat_id, recipient, &value)
@@ -490,7 +519,7 @@ fn parse_command(text: &str, mentions: &[Mention], bot_id: &str, p2p: bool) -> O
     })
 }
 
-fn build_lobby_card(game: &WolfGame) -> Value {
+fn build_lobby_card(game: &WolfGame, ai_enabled: bool) -> Value {
     let in_progress = !matches!(game.stage, Stage::Lobby | Stage::Ended);
     let subtitle = if in_progress {
         format!("狼人杀 · {} · 第 {} 天", game.stage.label(), game.day)
@@ -533,16 +562,35 @@ fn build_lobby_card(game: &WolfGame) -> Value {
     }
     if !in_progress {
         let base = json!({"chat_id": game.chat_id});
-        let mut roster = vec![button(
-            "加入",
-            merge(&base, &json!({"action":"join_lobby"})),
-            "primary",
-        )];
-        roster.push(button(
-            "AI 补齐人数",
-            merge(&base, &json!({"action":"fill_ai_lobby"})),
-            "default",
-        ));
+        let mut roster = vec![];
+        if game.players.len() < 12 {
+            roster.push(button(
+                "加入",
+                merge(&base, &json!({"action":"join_lobby"})),
+                "primary",
+            ));
+            if ai_enabled {
+                roster.push(button(
+                    "加入 AI",
+                    merge(&base, &json!({"action":"add_ai_lobby"})),
+                    "default",
+                ));
+            }
+        }
+        if ai_enabled && game.players.len() < 9 {
+            roster.push(button(
+                "AI 补齐人数",
+                merge(&base, &json!({"action":"fill_ai_lobby"})),
+                "default",
+            ));
+        }
+        if ai_enabled && game.players.iter().any(|player| player.is_ai) {
+            roster.push(button(
+                "移除 AI",
+                merge(&base, &json!({"action":"remove_ai_lobby"})),
+                "default",
+            ));
+        }
         if !game.players.is_empty() {
             roster.push(button(
                 "离开",
@@ -583,9 +631,9 @@ fn build_lobby_card(game: &WolfGame) -> Value {
 
 fn build_bot_added_welcome_card(ai_enabled: bool, inviter: &str) -> Value {
     let ai_note = if ai_enabled {
-        "人数不足时可点击 **AI 补齐人数**。"
+        "可逐个 **加入 AI**，人数不足时也可一键 **AI 补齐人数**。"
     } else {
-        "配置 OPENAI_API_KEY 后可使用 AI 补齐人数。"
+        "配置 OPENAI_API_KEY 后可使用 AI 玩家。"
     };
     card(
         header_with_subtitle("🐺 夜局 · 狼人杀", "飞书群里的 AI 狼人杀", "turquoise"),
@@ -617,6 +665,33 @@ fn ai_seats_needed(player_count: usize) -> usize {
     9usize.saturating_sub(player_count)
 }
 
+fn add_ai_players(game: &mut WolfGame, count: usize) -> Result<()> {
+    if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
+        return Err(anyhow!("狼人杀已经开始"));
+    }
+    if game.players.len().saturating_add(count) > 12 {
+        return Err(anyhow!("人数已满 (12)"));
+    }
+    let mut next = game
+        .players
+        .iter()
+        .filter_map(|player| player.open_id.strip_prefix("ai:"))
+        .filter_map(|number| number.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    for _ in 0..count {
+        let persona = Persona::random();
+        game.add_ai_player(
+            format!("ai:{next}"),
+            format!("{} #{}", persona.label(), game.players.len() + 1),
+            persona,
+        )?;
+        next += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,9 +707,40 @@ mod tests {
     #[test]
     fn lobby_contains_one_click_ai_fill_action() {
         let game = WolfGame::new("oc_test".into());
-        let encoded = sonic_rs::to_string(&build_lobby_card(&game)).unwrap();
+        let encoded = sonic_rs::to_string(&build_lobby_card(&game, true)).unwrap();
         assert!(encoded.contains("AI 补齐人数"));
         assert!(encoded.contains("fill_ai_lobby"));
+        assert!(encoded.contains("加入 AI"));
+        assert!(encoded.contains("add_ai_lobby"));
+    }
+
+    #[test]
+    fn individual_ai_seats_can_extend_a_nine_player_lobby_to_twelve() {
+        let mut game = WolfGame::new("oc_test".into());
+        add_ai_players(&mut game, 9).unwrap();
+        assert_eq!(game.players.len(), 9);
+        let nine_player_card = sonic_rs::to_string(&build_lobby_card(&game, true)).unwrap();
+        assert!(nine_player_card.contains("add_ai_lobby"));
+        assert!(!nine_player_card.contains("fill_ai_lobby"));
+
+        for expected in 10..=12 {
+            add_ai_players(&mut game, 1).unwrap();
+            assert_eq!(game.players.len(), expected);
+        }
+        assert!(add_ai_players(&mut game, 1).is_err());
+
+        let encoded = sonic_rs::to_string(&build_lobby_card(&game, true)).unwrap();
+        assert!(!encoded.contains("add_ai_lobby"));
+        assert!(encoded.contains("remove_ai_lobby"));
+    }
+
+    #[test]
+    fn ai_controls_are_hidden_without_an_api_key() {
+        let game = WolfGame::new("oc_test".into());
+        let encoded = sonic_rs::to_string(&build_lobby_card(&game, false)).unwrap();
+        assert!(!encoded.contains("add_ai_lobby"));
+        assert!(!encoded.contains("fill_ai_lobby"));
+        assert!(!encoded.contains("remove_ai_lobby"));
     }
 
     #[test]
