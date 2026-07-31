@@ -4,13 +4,13 @@
 //! 同时最多一桌狼人杀，由 `bot.wolf_games` map 管理。
 //!
 //! 推进核心：`advance_wolf` 串行驱动 AI 完成所有当前阶段能立即推进的工作，
-//! 直到必须等待人类点击为止 —— 复用德州扑克的 `advance_actor` 模式。
+//! 直到必须等待人类点击为止。
 
 use crate::bot::{toast, Bot};
 use crate::feishu::cards::{card, header, markdown};
 use crate::feishu::events::{CardAction, InboundMessage};
 #[allow(unused_imports)]
-use crate::game::Persona;
+use crate::persona::Persona;
 use crate::werewolf::cards::*;
 use crate::werewolf::game::*;
 use crate::werewolf::llm as wolf_llm;
@@ -46,12 +46,12 @@ impl Bot {
             header("🐺 狼人杀 帮助", "purple"),
             vec![
                 markdown(
-                    "**操作方式**：先在统一大厅 [加入] 进房，然后点 [开始狼人杀] 按钮，\
-                     或 `/wolf start`。\n\n\
-                     • `wolf join` 加入房间（等同于 `join`）\n\
-                     • `wolf leave` 离开（等同于 `leave`）\n\
+                    "**操作方式**：先在大厅 [加入] 进房，然后点 [开始狼人杀] 按钮，\
+                     或 `/wolf start`。人数不足时可点 [AI 补齐人数] 一键补到 9 人。\n\n\
+                     • `wolf join` 加入房间\n\
+                     • `wolf leave` 离开房间\n\
                      • `wolf start` 开狼人杀（9-12 名玩家）\n\
-                     • `wolf reset` 重置房间（等同于 `reset`）\n\n\
+                     • `wolf reset` 重置房间\n\n\
                      **板娘配比**：\n\
                      • 9 人：3 狼 / 预 / 女 / 猎 / 3 民（不上警）\n\
                      • 10 人：2 狼 + **狼王** / 预 / 女 / 猎 / **守** / 3 民\n\
@@ -715,7 +715,7 @@ impl Bot {
     // ========================================================================
 
     /// 串行驱动游戏前进——每个阶段处理 AI 自动行动 / 公告 / 状态切换，直到必须等待人类点击为止。
-    /// 像德州扑克的 advance_actor 那样可重入：每次外部事件后都安全地再调用一次。
+    /// 可重入：每次外部事件后都安全地再调用一次。
     pub(crate) async fn advance_wolf(&self, chat_id: &str) {
         // 防递归：上限若干次循环避免任何意外。
         for _ in 0..50 {
@@ -2073,10 +2073,10 @@ impl Bot {
                             .await;
                         info!(chat = %chat_id, winner = ?w, "wolf game ended");
                     }
-                    // 把统一大厅卡推到最下面：清掉 poker game 里的 lobby_msg_id
-                    if let Some(pg) = self.games.lock().get_mut(chat_id) {
-                        pg.lobby_msg_id = None;
-                        self.persist_locked(chat_id, pg);
+                    // 结束后把新大厅卡推到消息流底部。
+                    if let Some(game) = self.wolf_games.lock().get_mut(chat_id) {
+                        game.lobby_msg_id = None;
+                        self.persist_wolf_locked(chat_id, game);
                     }
                     let _ = self.refresh_lobby(chat_id).await;
                 }

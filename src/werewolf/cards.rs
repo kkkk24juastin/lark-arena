@@ -1,6 +1,6 @@
 //! 狼人杀的卡片渲染。
 //!
-//! 命名约定：所有 callback action id 以 `wolf_` 前缀，避免和德州扑克冲突。
+//! 命名约定：所有 callback action id 以 `wolf_` 前缀，便于路由。
 //!
 //! 关键卡片：
 //! - lobby：持久大厅卡，原地更新
@@ -1285,4 +1285,3 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
     }
     out
 }
-

@@ -2,13 +2,13 @@
 name = "lark-arena"
 version = "0.3.0"
 edition = "2024"
-description = "Feishu (Lark) group-chat AI game arena — Texas Hold'em + Werewolf, LLM-driven AI seats"
-rust-version = "1.85"
+description = "Feishu (Lark) group-chat Werewolf game with LLM-driven AI seats"
+rust-version = "1.89"
 license = "GPL-3.0"
 repository = "https://github.com/gtoxlili/lark-arena"
 homepage = "https://github.com/gtoxlili/lark-arena"
 readme = "README.md"
-keywords = ["feishu", "lark", "poker", "werewolf", "llm"]
+keywords = ["feishu", "lark", "werewolf", "llm"]
 categories = ["games", "command-line-utilities"]
 
 [dependencies]
@@ -39,19 +39,9 @@ sonic-rs = "0.5"
 # upstream. We use it for every HashMap/HashSet outside std.
 foldhash = "0.2"
 hashbrown = { version = "0.16", features = ["serde", "default-hasher"] }
-# Inline small Vec<T> when ≤ N items: hole cards (always 2), nominators,
-# action logs early in a hand, etc. 2.x is the const-generic refresh.
-smallvec = { version = "2.0.0-alpha.12", features = ["serde"] }
-
 # --- randomness ----------------------------------------------------------
-# fastrand is dramatically faster than rand for non-crypto needs (shuffle,
-# choose, persona pick). Single-threaded thread-local PRNG.
+# fastrand is used for role shuffling and AI persona selection.
 fastrand = "2"
-
-# --- parallelism ---------------------------------------------------------
-# Equity Monte Carlo is embarrassingly parallel — rayon gives us a free
-# n-core speedup on the AI's pre-decision equity sim.
-rayon = "1.12"
 
 # --- concurrency primitives ---------------------------------------------
 parking_lot = "0.12"
@@ -64,7 +54,6 @@ arc-swap = "1.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
-itertools = "0.14"
 uuid = { version = "1.23", features = ["v4", "v7", "fast-rng"] }
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion"] }
 redb = "4"

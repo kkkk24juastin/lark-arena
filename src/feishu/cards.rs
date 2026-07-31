@@ -71,28 +71,6 @@ pub fn note(content: &str) -> Value {
     })
 }
 
-/// Bigger / heading-sized markdown — used for the rank+suit on card tiles.
-pub fn heading_md(content: &str) -> Value {
-    json!({
-        "tag": "markdown",
-        "text_size": "heading",
-        "text_align": "center",
-        "content": content,
-    })
-}
-
-/// Same as `heading_md` but the content is wrapped in a `<font>` tag so the
-/// caller can pick a colour (e.g. `"white"` for content sitting on a red
-/// background). Lark's `markdown` component honours inline `<font color="...">`.
-pub fn heading_md_colored(content: &str, text_color: &str) -> Value {
-    json!({
-        "tag": "markdown",
-        "text_size": "heading",
-        "text_align": "center",
-        "content": format!("<font color='{}'>{}</font>", text_color, content),
-    })
-}
-
 /// Aliases kept so callers from the v1.0 API don't need to be renamed.
 pub fn div_md(content: &str) -> Value {
     markdown(content)
@@ -122,19 +100,6 @@ pub fn column(elements: Vec<Value>, weight: u32) -> Value {
         "width": "weighted",
         "weight": weight,
         "vertical_align": "center",
-        "elements": elements,
-    })
-}
-
-/// A column with a coloured background — used for visual card tiles.
-pub fn tile_column(elements: Vec<Value>, weight: u32, bg_style: &str) -> Value {
-    json!({
-        "tag": "column",
-        "width": "weighted",
-        "weight": weight,
-        "vertical_align": "center",
-        "padding": "12px 8px 12px 8px",
-        "background_style": bg_style,
         "elements": elements,
     })
 }

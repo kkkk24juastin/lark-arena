@@ -10,7 +10,7 @@
 //!
 //! 所有决策走同一个 `LlmClient::chat_json` 入口；构造 prompt 和解析输出在这里完成。
 
-use crate::game::Persona;
+use crate::persona::Persona;
 use crate::llm::LlmClient;
 use crate::util::{FastHashMap, FoldHashSet};
 use crate::werewolf::game::*;

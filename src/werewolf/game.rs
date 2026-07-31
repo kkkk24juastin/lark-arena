@@ -13,7 +13,7 @@
 //! → (HunterShoot if hunter lynched)
 //! → 检查胜负 → 下一夜 / Ended
 
-use crate::game::Persona;
+use crate::persona::Persona;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 

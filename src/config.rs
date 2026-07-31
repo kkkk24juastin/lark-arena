@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_openai::types::chat::ReasoningEffort;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -12,6 +13,7 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
     pub openai_model: String,
+    pub openai_reasoning_effort: ReasoningEffort,
     /// Path to the redb file holding persisted game state.
     pub db_path: String,
 }
@@ -21,7 +23,8 @@ impl Config {
         let _ = load_dotenv();
         Ok(Self {
             app_id: std::env::var("FEISHU_APP_ID").context("FEISHU_APP_ID is required")?,
-            app_secret: std::env::var("FEISHU_APP_SECRET").context("FEISHU_APP_SECRET is required")?,
+            app_secret: std::env::var("FEISHU_APP_SECRET")
+                .context("FEISHU_APP_SECRET is required")?,
             bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
             allowed_chat_id: env_opt("ALLOWED_CHAT_ID"),
             verification_token: env_opt("FEISHU_VERIFICATION_TOKEN"),
@@ -30,9 +33,27 @@ impl Config {
                 .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
             openai_model: env_opt("OPENAI_MODEL")
                 .unwrap_or_else(|| "deepseek-v4-flash".to_string()),
-            db_path: env_opt("LARK_ARENA_DB_PATH")
-                .unwrap_or_else(|| "arena.redb".to_string()),
+            openai_reasoning_effort: parse_reasoning_effort(
+                env_opt("OPENAI_REASONING_EFFORT")
+                    .as_deref()
+                    .unwrap_or("xhigh"),
+            )?,
+            db_path: env_opt("LARK_ARENA_DB_PATH").unwrap_or_else(|| "arena.redb".to_string()),
         })
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(ReasoningEffort::None),
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        other => anyhow::bail!(
+            "OPENAI_REASONING_EFFORT must be one of: none, minimal, low, medium, high, xhigh; got {other:?}"
+        ),
     }
 }
 
@@ -60,4 +81,26 @@ fn load_dotenv() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_accepts_all_sdk_levels() {
+        for value in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            assert!(parse_reasoning_effort(value).is_ok(), "rejected {value}");
+        }
+        assert_eq!(
+            parse_reasoning_effort("HIGH").unwrap(),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_unknown_value() {
+        let error = parse_reasoning_effort("extreme").unwrap_err().to_string();
+        assert!(error.contains("OPENAI_REASONING_EFFORT"));
+    }
 }

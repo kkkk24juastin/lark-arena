@@ -1,56 +1,31 @@
 use crate::config::Config;
 use crate::feishu::cards::*;
 use crate::feishu::events::{BotAdded, CardAction, InboundMessage, MemberAdded, Mention};
-use crate::feishu::Client as FeishuClient;
-use crate::game::{*, Persona};
-use crate::llm::{AiDecision, DecisionContext, LlmClient};
-use crate::poker::{best_five, category_name, Card, DeckMode};
+use crate::llm::LlmClient;
+use crate::persona::Persona;
 use crate::storage::Store;
-use crate::werewolf::WolfGame;
-
 use crate::util::FoldHashMap;
-use anyhow::{anyhow, Result};
+use crate::werewolf::{WolfGame, game::Stage};
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub struct Bot {
-    pub client: Arc<FeishuClient>,
+    pub client: Arc<crate::feishu::Client>,
     pub(crate) cfg: Config,
-    pub(crate) games: Mutex<FoldHashMap<String, Game>>, // chat_id → game
-    /// Werewolf games keyed by chat_id, parallel to `games`. A chat can host
-    /// both a poker table and a werewolf table simultaneously — they share
-    /// nothing except the same dedup / LLM / store infrastructure.
     pub(crate) wolf_games: Mutex<FoldHashMap<String, WolfGame>>,
     pub(crate) bot_open_id: Mutex<Option<String>>,
-    /// Dedup cache keyed by `header.event_id` — catches Feishu's same-id
-    /// retries within a long window.
     pub(crate) seen_events: Mutex<FoldHashMap<String, Instant>>,
-    /// Fallback dedup keyed by a content fingerprint of card actions
-    /// (`open_id` + `value` JSON). Catches the empirical case where Feishu
-    /// re-delivers the *same logical click* under a different `event_id`.
-    /// Short window (a few seconds) so legitimate re-clicks later are still
-    /// processed.
     pub(crate) seen_actions: Mutex<FoldHashMap<u64, Instant>>,
-    /// LLM client. `None` when `OPENAI_API_KEY` is unset → AI features hide.
     pub(crate) llm: Option<LlmClient>,
-    /// Disk-backed game state. Loaded on startup, written after each mutation.
     pub(crate) store: Arc<Store>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
-    // 德州扑克
-    Join,
-    Leave,
-    Start,
-    State,
-    Chips,
-    Reset,
-    Help,
-    // 狼人杀
     WolfJoin,
     WolfLeave,
     WolfStart,
@@ -59,43 +34,27 @@ pub(crate) enum Command {
 }
 
 impl Bot {
-    pub fn new(client: Arc<FeishuClient>, cfg: Config, store: Arc<Store>) -> Arc<Self> {
+    pub fn new(client: Arc<crate::feishu::Client>, cfg: Config, store: Arc<Store>) -> Arc<Self> {
         let llm = cfg.openai_api_key.clone().map(|key| {
-            LlmClient::new(key, cfg.openai_base_url.clone(), cfg.openai_model.clone())
+            info!(
+                model = %cfg.openai_model,
+                reasoning_effort = ?cfg.openai_reasoning_effort,
+                "LLM AI seats enabled"
+            );
+            LlmClient::new(
+                key,
+                cfg.openai_base_url.clone(),
+                cfg.openai_model.clone(),
+                cfg.openai_reasoning_effort.clone(),
+            )
         });
-        if llm.is_some() {
-            info!(model = %cfg.openai_model, "LLM AI seat enabled");
-        }
-        // Replay persisted games. Any in-flight hand is treated like a "stuck"
-        // hand by start_hand: refunded + reset on the next [开局].
-        let games = match store.load_all() {
-            Ok(loaded) => {
-                if !loaded.is_empty() {
-                    info!(count = loaded.len(), "restored poker games from disk");
-                }
-                loaded
-            }
-            Err(e) => {
-                warn!(?e, "failed to load poker games from disk; starting empty");
-                FoldHashMap::default()
-            }
-        };
-        let wolf_games = match store.load_all_wolf() {
-            Ok(loaded) => {
-                if !loaded.is_empty() {
-                    info!(count = loaded.len(), "restored werewolf games from disk");
-                }
-                loaded
-            }
-            Err(e) => {
-                warn!(?e, "failed to load werewolf games from disk; starting empty");
-                FoldHashMap::default()
-            }
-        };
+        let wolf_games = store.load_all_wolf().unwrap_or_else(|e| {
+            warn!(?e, "failed to load werewolf games; starting empty");
+            FoldHashMap::default()
+        });
         Arc::new(Self {
             client,
             cfg,
-            games: Mutex::new(games),
             wolf_games: Mutex::new(wolf_games),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(FoldHashMap::default()),
@@ -105,145 +64,54 @@ impl Bot {
         })
     }
 
-    /// Save the current `Game` for `chat_id` to disk. Call from inside a
-    /// `games.lock()` scope right after a successful mutation so persistence
-    /// is serialised with the state change.
-    pub(crate) fn persist_locked(&self, chat_id: &str, game: &Game) {
-        if let Err(e) = self.store.save(chat_id, game) {
-            warn!(?e, %chat_id, "persist game failed");
-        }
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+    pub fn set_bot_open_id(&self, id: String) {
+        *self.bot_open_id.lock() = Some(id);
+    }
+    fn bot_open_id_clone(&self) -> Option<String> {
+        self.bot_open_id.lock().clone()
     }
 
-    fn forget_chat(&self, chat_id: &str) {
-        if let Err(e) = self.store.delete(chat_id) {
-            warn!(?e, %chat_id, "delete game failed");
-        }
-    }
-
-    /// Returns true if `event_id` has been seen in the last ~2 minutes.
-    /// Empty `event_id` (legacy payloads without one) is never deduped.
     pub(crate) fn is_duplicate_event(&self, event_id: &str) -> bool {
         if event_id.is_empty() {
             return false;
         }
         let mut seen = self.seen_events.lock();
         seen.retain(|_, t| t.elapsed() < Duration::from_secs(120));
-        if let Some(first_seen) = seen.get(event_id) {
-            let age_ms = first_seen.elapsed().as_millis();
-            warn!(
-                event_id,
-                age_ms,
-                "duplicate callback dropped (event_id match)"
-            );
-            true
-        } else {
-            seen.insert(event_id.to_string(), Instant::now());
-            false
+        if seen.contains_key(event_id) {
+            return true;
         }
-    }
-
-    /// Fallback dedup for card actions: same `(open_id, value)` fingerprint
-    /// within ~3s is treated as a duplicate. This catches Feishu re-delivering
-    /// the same logical click under different `event_id`s (which we've
-    /// observed in practice — the docs claim card callbacks aren't retried,
-    /// but they sometimes are).
-    pub(crate) fn is_duplicate_action(&self, action: &CardAction) -> bool {
-        // Hot-path fingerprint: hash `open_id || value-json` into a single
-        // `u64` via foldhash (the same hasher backing our `FoldHashMap`).
-        // Avoids the per-event `String` allocation the old `format!` did,
-        // and the dedup probe becomes a u64 hash instead of a string hash.
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let mut h = foldhash::fast::FixedState::default().build_hasher();
-        action.open_id.hash(&mut h);
-        // `Value`'s `Hash` impl is order-stable for objects iff serde_json
-        // preserves insertion order — which it does (preserve_order is on
-        // by default for Map). We additionally fold in the SIMD-stringified
-        // form so deeply nested objects can't collide.
-        let s = sonic_rs::to_string(&action.value).unwrap_or_default();
-        s.hash(&mut h);
-        let fingerprint = h.finish();
-        let mut seen = self.seen_actions.lock();
-        seen.retain(|_, t| t.elapsed() < Duration::from_secs(10));
-        if let Some(first_seen) = seen.get(&fingerprint) {
-            if first_seen.elapsed() < Duration::from_secs(3) {
-                let age_ms = first_seen.elapsed().as_millis();
-                warn!(
-                    age_ms,
-                    "duplicate callback dropped (action fingerprint match within 3s)"
-                );
-                return true;
-            }
-        }
-        seen.insert(fingerprint, Instant::now());
+        seen.insert(event_id.to_string(), Instant::now());
         false
     }
 
-    pub fn cfg(&self) -> &Config {
-        &self.cfg
+    pub(crate) fn is_duplicate_action(&self, action: &CardAction) -> bool {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut h = foldhash::fast::FixedState::default().build_hasher();
+        action.open_id.hash(&mut h);
+        sonic_rs::to_string(&action.value)
+            .unwrap_or_default()
+            .hash(&mut h);
+        let key = h.finish();
+        let mut seen = self.seen_actions.lock();
+        seen.retain(|_, t| t.elapsed() < Duration::from_secs(10));
+        if seen
+            .get(&key)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3))
+        {
+            return true;
+        }
+        seen.insert(key, Instant::now());
+        false
     }
 
-    /// Set once on startup so we can identify mentions of ourselves.
-    pub fn set_bot_open_id(&self, open_id: String) {
-        *self.bot_open_id.lock() = Some(open_id);
-    }
-
-    pub(crate) fn bot_open_id_clone(&self) -> Option<String> {
-        self.bot_open_id.lock().clone()
-    }
-
-    pub async fn handle_message(self: Arc<Self>, msg: InboundMessage) -> Result<()> {
-        if self.is_duplicate_event(&msg.event_id) {
-            return Ok(());
-        }
-        if msg.message_type != "text" {
-            return Ok(());
-        }
-        if let Some(allowed) = &self.cfg.allowed_chat_id {
-            if &msg.chat_id != allowed && msg.chat_type != "p2p" {
-                return Ok(());
-            }
-        }
-
-        let bot_oid = self.bot_open_id_clone().unwrap_or_default();
-        let cmd = parse_command(&msg.text, &msg.mentions, &bot_oid, msg.chat_type == "p2p");
-
-        let Some(cmd) = cmd else {
-            return Ok(());
-        };
-
-        info!(?cmd, chat = %msg.chat_id, sender = %msg.sender_open_id, "command");
-        if let Err(e) = self.dispatch_command(cmd, &msg).await {
-            // Error feedback goes only to the user who sent the command — no need
-            // to clutter the group with a public reply.
-            let c = card(header("⚠️", "red"), vec![div_md(&format!("{e}"))]);
-            let _ = self.send_user_only(&msg, &c).await;
-        }
-        Ok(())
-    }
-
-    async fn dispatch_command(&self, cmd: Command, msg: &InboundMessage) -> Result<()> {
-        match cmd {
-            Command::Help => self.send_help(msg).await,
-            Command::Join => self.cmd_join(msg).await,
-            Command::Leave => self.cmd_leave(msg).await,
-            Command::Start => self.cmd_start(msg).await,
-            Command::State => self.cmd_state(msg).await,
-            Command::Chips => self.cmd_chips(msg).await,
-            Command::Reset => self.cmd_reset(msg).await,
-            // 狼人杀文字命令：join/leave/reset 共用统一房间名册（走 poker 路径），
-            // 仅 start 走狼人杀专属流程。
-            Command::WolfHelp => self.send_wolf_help(msg).await,
-            Command::WolfJoin => self.cmd_join(msg).await,
-            Command::WolfLeave => self.cmd_leave(msg).await,
-            Command::WolfStart => self.do_start_wolf(&msg.chat_id).await,
-            Command::WolfReset => self.cmd_reset(msg).await,
-        }
-    }
-
-    /// Send a card visible only to `msg.sender_open_id`. In a group chat that's
-    /// an ephemeral message (others can't see it); in a 1-on-1 chat with the
-    /// bot it falls back to a regular message (the chat is already private).
-    pub(crate) async fn send_user_only(&self, msg: &InboundMessage, card: &Value) -> Result<String> {
+    pub(crate) async fn send_user_only(
+        &self,
+        msg: &InboundMessage,
+        card: &Value,
+    ) -> Result<String> {
         if msg.chat_type == "p2p" {
             self.client
                 .send_message("chat_id", &msg.chat_id, "interactive", card)
@@ -255,2307 +123,526 @@ impl Bot {
         }
     }
 
-    async fn send_help(&self, msg: &InboundMessage) -> Result<()> {
-        let c = card(
-            header("德州扑克 帮助", "blue"),
-            vec![
-                div_md(
-                    "**操作方式**：通过卡片按钮，或在群里 @机器人 + 关键词\n\n\
-                     • `join` 加入下一局\n\
-                     • `leave` 离开\n\
-                     • `start` 开局 (≥2 名玩家)\n\
-                     • `state` 当前状态\n\
-                     • `chips` 各玩家筹码\n\
-                     • `reset` 重置牌桌\n\n\
-                     游戏内行动均为卡片按钮：弃牌 / 跟注 / 加注 / 全押。",
-                ),
-                note_md("初始筹码 1000 · 小盲 5 / 大盲 10 · 手牌以**仅本人可见**的群消息发出"),
-            ],
-        );
-        self.send_user_only(msg, &c).await?;
+    pub async fn handle_message(self: Arc<Self>, msg: InboundMessage) -> Result<()> {
+        if self.is_duplicate_event(&msg.event_id) || msg.message_type != "text" {
+            return Ok(());
+        }
+        if let Some(allowed) = &self.cfg.allowed_chat_id {
+            if &msg.chat_id != allowed && msg.chat_type != "p2p" {
+                return Ok(());
+            }
+        }
+        let bot_id = self.bot_open_id_clone().unwrap_or_default();
+        let Some(cmd) = parse_command(&msg.text, &msg.mentions, &bot_id, msg.chat_type == "p2p")
+        else {
+            return Ok(());
+        };
+        if let Err(e) = self.dispatch_command(cmd, &msg).await {
+            let _ = self
+                .send_user_only(
+                    &msg,
+                    &card(header("无法执行", "red"), vec![div_md(&e.to_string())]),
+                )
+                .await;
+        }
         Ok(())
     }
 
-    async fn cmd_join(&self, msg: &InboundMessage) -> Result<()> {
-        let name = self
-            .client
-            .user_name(&msg.sender_open_id)
-            .await
-            .unwrap_or_else(|_| "玩家".into());
-        self.do_join(&msg.chat_id, &msg.sender_open_id, &name).await
-    }
-
-    async fn cmd_leave(&self, msg: &InboundMessage) -> Result<()> {
-        self.do_leave(&msg.chat_id, &msg.sender_open_id).await
-    }
-
-    async fn cmd_reset(&self, msg: &InboundMessage) -> Result<()> {
-        self.do_reset(&msg.chat_id).await
+    async fn dispatch_command(&self, cmd: Command, msg: &InboundMessage) -> Result<()> {
+        match cmd {
+            Command::WolfHelp => self.send_wolf_help(msg).await,
+            Command::WolfJoin => {
+                let name = self
+                    .client
+                    .user_name(&msg.sender_open_id)
+                    .await
+                    .unwrap_or_else(|_| "玩家".into());
+                self.do_join(&msg.chat_id, &msg.sender_open_id, &name).await
+            }
+            Command::WolfLeave => self.do_leave(&msg.chat_id, &msg.sender_open_id).await,
+            Command::WolfStart => self.do_start_wolf(&msg.chat_id).await,
+            Command::WolfReset => self.do_reset(&msg.chat_id).await,
+        }
     }
 
     async fn do_join(&self, chat_id: &str, open_id: &str, name: &str) -> Result<()> {
         {
-            let mut games = self.games.lock();
+            let mut games = self.wolf_games.lock();
             let game = games
                 .entry(chat_id.to_string())
-                .or_insert_with(|| Game::new(chat_id.to_string()));
+                .or_insert_with(|| WolfGame::new(chat_id.to_string()));
             game.add_player(open_id.to_string(), name.to_string())?;
-            self.persist_locked(chat_id, game);
-        }
-        self.refresh_lobby(chat_id).await
-    }
-
-    async fn do_remove_ai(&self, chat_id: &str) -> Result<()> {
-        {
-            let mut games = self.games.lock();
-            let game = games
-                .get_mut(chat_id)
-                .ok_or_else(|| anyhow!("当前没有牌局"))?;
-            let _removed = game.remove_last_ai()?;
-            self.persist_locked(chat_id, game);
-        }
-        self.refresh_lobby(chat_id).await
-    }
-
-    async fn do_join_ai(&self, chat_id: &str) -> Result<()> {
-        if self.llm.is_none() {
-            return Err(anyhow!("机器人未配置 LLM (OPENAI_API_KEY 缺失)，无法加入 AI"));
-        }
-        {
-            let mut games = self.games.lock();
-            let game = games
-                .entry(chat_id.to_string())
-                .or_insert_with(|| Game::new(chat_id.to_string()));
-            // AI 名字后缀用座位号（1-indexed），跟人类玩家穿插坐时也对得上：
-            // 之前用『AI 数 +1』在『AI / AI / 人类 / AI』这种排列里，
-            // 第 4 个座位的 AI 会被叫成 #3，AI 们互相称呼就乱套了。
-            let n = game.players.len() + 1;
-            // ai_id 用全局递增 unique 值——不能跟座位号 / # 后缀绑（人离场
-            // 重排会让旧 ai_id 撞车）。从已有 ai:* id 里找最大数 +1。
-            let unique = game
-                .players
-                .iter()
-                .filter_map(|p| p.open_id.strip_prefix("ai:").and_then(|s| s.parse::<u32>().ok()))
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(1);
-            let persona = Persona::random();
-            let ai_id = format!("ai:{}", unique);
-            let ai_name = format!("{} #{}", persona.label(), n);
-            game.add_ai_player(ai_id, ai_name, persona)?;
-            self.persist_locked(chat_id, game);
+            self.persist_wolf_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
 
     async fn do_leave(&self, chat_id: &str, open_id: &str) -> Result<()> {
         {
-            let mut games = self.games.lock();
+            let mut games = self.wolf_games.lock();
             let game = games
                 .get_mut(chat_id)
-                .ok_or_else(|| anyhow!("当前没有牌局"))?;
-            game.remove_player(open_id)?;
-            self.persist_locked(chat_id, game);
+                .ok_or_else(|| anyhow!("当前没有狼人杀房间"))?;
+            if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
+                return Err(anyhow!("狼人杀进行中，不能离开"));
+            }
+            let idx = game
+                .find_player(open_id)
+                .ok_or_else(|| anyhow!("你还没有加入房间"))?;
+            game.players.remove(idx);
+            self.persist_wolf_locked(chat_id, game);
+        }
+        self.refresh_lobby(chat_id).await
+    }
+
+    async fn fill_ai_lobby(&self, chat_id: &str) -> Result<()> {
+        if self.llm.is_none() {
+            return Err(anyhow!("机器人未配置 OPENAI_API_KEY，暂时无法使用 AI 补齐"));
+        }
+        {
+            let mut games = self.wolf_games.lock();
+            let game = games
+                .entry(chat_id.to_string())
+                .or_insert_with(|| WolfGame::new(chat_id.to_string()));
+            if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
+                return Err(anyhow!("狼人杀已经开始"));
+            }
+            let mut next = game
+                .players
+                .iter()
+                .filter_map(|p| p.open_id.strip_prefix("ai:"))
+                .filter_map(|n| n.parse::<u32>().ok())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            for _ in 0..ai_seats_needed(game.players.len()) {
+                let persona = Persona::random();
+                game.add_ai_player(
+                    format!("ai:{next}"),
+                    format!("{} #{}", persona.label(), game.players.len() + 1),
+                    persona,
+                )?;
+                next += 1;
+            }
+            self.persist_wolf_locked(chat_id, game);
         }
         self.refresh_lobby(chat_id).await
     }
 
     pub(crate) async fn do_reset(&self, chat_id: &str) -> Result<()> {
-        {
-            self.games.lock().remove(chat_id);
-            self.wolf_games.lock().remove(chat_id);
-        }
-        self.forget_chat(chat_id);
-        if let Err(e) = self.store.delete_wolf(chat_id) {
-            warn!(?e, %chat_id, "delete wolf game failed");
-        }
-        // After reset, post a fresh lobby card to invite players in.
-        let _ = self.refresh_lobby(chat_id).await;
-        let c = card(
-            header("♻️ 房间已重置", "wathet"),
-            vec![div_md("点击下方大厅卡的 **加入** 重新开始。")],
-        );
-        self.client
-            .send_message("chat_id", chat_id, "interactive", &c)
-            .await?;
-        Ok(())
-    }
-
-    /// Post or update the persistent lobby card in `chat_id`. Idempotent — safe to call
-    /// after every state change. If the card for this chat doesn't exist yet, posts a
-    /// new one and stores its message_id for future in-place updates.
-    ///
-    /// 统一的大厅卡同时反映德州和狼人杀两种状态：进行中只显示状态，空闲时显示
-    /// 双模式开局按钮。
-    pub(crate) async fn refresh_lobby(&self, chat_id: &str) -> Result<()> {
-        let wolf_status = {
-            let wgames = self.wolf_games.lock();
-            wgames.get(chat_id).map(|g| WolfLobbyStatus {
-                in_progress: !matches!(
-                    g.stage,
-                    crate::werewolf::game::Stage::Lobby | crate::werewolf::game::Stage::Ended
-                ),
-                stage_label: g.stage.label().to_string(),
-                day: g.day,
-            })
-        };
-        let (card_value, existing_msg_id) = {
-            let games = self.games.lock();
-            let Some(game) = games.get(chat_id) else { return Ok(()); };
-            let snap = snapshot(game);
-            (
-                build_lobby_card(&snap, self.llm.is_some(), wolf_status.as_ref()),
-                game.lobby_msg_id.clone(),
-            )
-        };
-
-        if let Some(msg_id) = existing_msg_id {
-            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
-                return Ok(());
-            }
-            // fall through to posting a new card if update failed (card was deleted, etc.)
-        }
-        let new_id = self
-            .client
-            .send_message("chat_id", chat_id, "interactive", &card_value)
-            .await?;
-        if let Some(g) = self.games.lock().get_mut(chat_id) {
-            g.lobby_msg_id = Some(new_id);
-            self.persist_locked(chat_id, g);
-        }
-        Ok(())
-    }
-
-    async fn cmd_chips(&self, msg: &InboundMessage) -> Result<()> {
-        let body = {
-            let games = self.games.lock();
-            let game = games
-                .get(&msg.chat_id)
-                .ok_or_else(|| anyhow!("当前没有牌局"))?;
-            if game.players.is_empty() {
-                return Err(anyhow!("还没有玩家加入"));
-            }
-            game.players
-                .iter()
-                .map(|p| {
-                    let snap_p = PlayerSnapshot {
-                        open_id: p.open_id.clone(),
-                        name: p.name.clone(),
-                        chips: p.chips,
-                        bet_in_round: p.bet_in_round,
-                        folded: p.folded,
-                        all_in: p.all_in,
-                        sat_out: p.sat_out,
-                        is_ai: p.is_ai,
-                        persona: p.persona,
-                    };
-                    format!("• {} — **{}** 筹码", display_name(&snap_p), p.chips)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let c = card(header("筹码", "blue"), vec![div_md(&body)]);
-        self.send_user_only(msg, &c).await?;
-        Ok(())
-    }
-
-    async fn cmd_state(&self, msg: &InboundMessage) -> Result<()> {
-        let prep = {
-            let games = self.games.lock();
-            let game = games.get(&msg.chat_id).ok_or_else(|| anyhow!("当前没有牌局"))?;
-            let snap = snapshot_for(game, Some(msg.sender_open_id.as_str()));
-            let n_opp = game
-                .players
-                .iter()
-                .filter(|p| {
-                    !p.folded && !p.sat_out && p.open_id != msg.sender_open_id
-                })
-                .count();
-            (snap, n_opp)
-        };
-        let (snap, n_opp) = prep;
-        let am_actor = snap.current_open_id.as_deref() == Some(msg.sender_open_id.as_str());
-        let stats = compute_viewer_stats(&snap, &msg.sender_open_id, n_opp);
-        let c = build_state_card(&snap, stats.as_ref(), am_actor);
-        self.send_user_only(msg, &c).await?;
-        Ok(())
-    }
-
-    async fn cmd_start(&self, msg: &InboundMessage) -> Result<()> {
-        // Allow `/poker start short` (or 短牌) to pick the short-deck variant.
-        let mode = if msg.text.contains("short") || msg.text.contains("短牌") {
-            DeckMode::ShortDeck
-        } else {
-            DeckMode::Standard
-        };
-        self.do_start(&msg.chat_id, mode).await
-    }
-
-    /// 从统一房间名册启动一局狼人杀。把 poker `Game` 里的玩家 (open_id / 名字 /
-    /// AI / persona) 拷贝到一个新的 `WolfGame`，然后走标准的开局流程：身份揭晓
-    /// → 公开公告 → AI 推进。
-    pub(crate) async fn do_start_wolf(&self, chat_id: &str) -> Result<()> {
-        // 1. 校验：房间内有玩家、人数 4-10、当前没有进行中的牌局
-        {
-            let games = self.games.lock();
-            let g = games
-                .get(chat_id)
-                .ok_or_else(|| anyhow!("当前没有玩家，先 join"))?;
-            let n = g.players.len();
-            if !(9..=12).contains(&n) {
-                return Err(anyhow!("狼人杀需要 9-12 名玩家，当前 {}", n));
-            }
-            if !matches!(g.stage, Stage::Lobby | Stage::Ended) {
-                return Err(anyhow!("德州牌局进行中，结束后再开狼人杀"));
-            }
-        }
-        {
-            let wgames = self.wolf_games.lock();
-            if let Some(wg) = wgames.get(chat_id) {
-                if !matches!(
-                    wg.stage,
-                    crate::werewolf::game::Stage::Lobby | crate::werewolf::game::Stage::Ended
-                ) {
-                    return Err(anyhow!("狼人杀进行中"));
-                }
-            }
-        }
-
-        // 2. 拷贝名册到新的 WolfGame，然后 start_game()
-        let (start_card, role_revealing): (Value, Vec<(String, Value, bool)>) = {
-            let games = self.games.lock();
-            let g = games
-                .get(chat_id)
-                .ok_or_else(|| anyhow!("房间消失了"))?;
-
-            let mut wolf = crate::werewolf::WolfGame::new(chat_id.to_string());
-            for p in &g.players {
-                if p.is_ai {
-                    let persona = p.persona.unwrap_or_else(Persona::random);
-                    wolf.add_ai_player(p.open_id.clone(), p.name.clone(), persona)?;
-                } else {
-                    wolf.add_player(p.open_id.clone(), p.name.clone())?;
-                }
-            }
-            wolf.start_game()?;
-
-            let start = crate::werewolf::cards::build_game_start_card(&wolf);
-            let mut reveals: Vec<(String, Value, bool)> = vec![];
-            for p in &wolf.players {
-                let c = crate::werewolf::cards::build_role_reveal_card(&wolf, p);
-                reveals.push((p.open_id.clone(), c, p.is_ai));
-            }
-
-            // 写入 wolf_games map + 持久化
-            drop(games);
-            let mut wgames = self.wolf_games.lock();
-            wgames.insert(chat_id.to_string(), wolf.clone());
-            self.persist_wolf_locked(chat_id, &wolf);
-
-            (start, reveals)
-        };
-
-        // 3. 刷新统一大厅卡（显示"狼人杀进行中"）
-        let _ = self.refresh_lobby(chat_id).await;
-
-        // 4. 公开公告
-        let _ = self
-            .client
-            .send_message("chat_id", chat_id, "interactive", &start_card)
-            .await;
-
-        // 5. 身份卡（仅人类）
-        for (open_id, c, is_ai) in role_revealing {
-            if is_ai {
-                continue;
-            }
-            if let Err(e) = self.client.send_ephemeral_card(chat_id, &open_id, &c).await {
-                warn!(?e, %open_id, "failed to send wolf role reveal");
-            }
-        }
-
-        // 6. 推进到第 1 夜 AI / 等待人类
-        self.advance_wolf(chat_id).await;
-        Ok(())
-    }
-
-    async fn do_start(&self, chat_id: &str, mode: DeckMode) -> Result<()> {
-        let (snap, hole_cards) = {
-            let mut games = self.games.lock();
-            let game = games
-                .get_mut(chat_id)
-                .ok_or_else(|| anyhow!("当前没有牌局, 先 join"))?;
-            game.start_hand(mode)?;
-            self.persist_locked(chat_id, game);
-            let snap = snapshot(game);
-            // Only humans get ephemeral hole-card messages — AI seats have
-            // synthetic open_ids that Feishu would reject.
-            let hole: Vec<(String, String, Vec<crate::poker::Card>)> = game
-                .players
-                .iter()
-                .filter(|p| !p.sat_out && !p.is_ai)
-                .map(|p| (p.open_id.clone(), p.name.clone(), p.hole.clone()))
-                .collect();
-            (snap, hole)
-        };
-
-        // Update the lobby card to "in progress" state (no buttons).
-        let _ = self.refresh_lobby(chat_id).await;
-
-        // Send each player their hole cards as ephemeral group messages —
-        // visible only to that user, no DM required.
-        for (open_id, _name, hole) in hole_cards {
-            let c = card(
-                header_with_subtitle(
-                    "🂠 你的手牌",
-                    &format!("第 {} 局", snap.hand_count),
-                    "purple",
-                ),
-                vec![
-                    cards_row(&hole),
-                    note("仅你可见 · 群里其他人看不到"),
-                ],
-            );
-            if let Err(e) = self
-                .client
-                .send_ephemeral_card(chat_id, &open_id, &c)
-                .await
-            {
-                warn!(?e, %open_id, "failed to deliver ephemeral hole cards");
-            }
-        }
-
-        // Public hand-start announcement so non-actors know the hand began,
-        // who's first, and what the blinds are. No buttons here.
+        self.store.delete_wolf(chat_id)?;
+        let game = WolfGame::new(chat_id.to_string());
+        self.persist_wolf_locked(chat_id, &game);
+        self.wolf_games.lock().insert(chat_id.to_string(), game);
         let _ = self
             .client
             .send_message(
                 "chat_id",
                 chat_id,
                 "interactive",
-                &build_hand_start_card(&snap),
+                &card(
+                    header("房间已重置", "wathet"),
+                    vec![div_md("请在下方大厅卡片重新加入狼人杀。")],
+                ),
             )
             .await;
-
-        // Drive forward — first actor will get an ephemeral, or if it's an
-        // AI seat we advance through it (and any consecutive AIs) right away.
-        self.advance_actor(chat_id).await;
+        self.refresh_lobby(chat_id).await?;
         Ok(())
     }
 
-    /// New user(s) added to the group → send each one an ephemeral welcome card
-    /// with a [加入下一局] button.
-    pub async fn handle_member_added(self: Arc<Self>, evt: MemberAdded) -> Result<()> {
-        if self.is_duplicate_event(&evt.event_id) {
-            return Ok(());
-        }
-        if let Some(allowed) = &self.cfg.allowed_chat_id {
-            if &evt.chat_id != allowed {
-                return Ok(());
+    pub(crate) async fn do_start_wolf(&self, chat_id: &str) -> Result<()> {
+        let (start_card, reveals) = {
+            let mut games = self.wolf_games.lock();
+            let game = games
+                .get_mut(chat_id)
+                .ok_or_else(|| anyhow!("当前没有玩家，先加入房间"))?;
+            if !(9..=12).contains(&game.players.len()) {
+                return Err(anyhow!(
+                    "狼人杀需要 9-12 名玩家，当前 {}",
+                    game.players.len()
+                ));
             }
-        }
-        for user in evt.users {
-            let c = build_welcome_card(&evt.chat_id, &user.name);
-            if let Err(e) = self
-                .client
-                .send_ephemeral_card(&evt.chat_id, &user.open_id, &c)
-                .await
-            {
-                warn!(?e, open_id = %user.open_id, "failed to send welcome ephemeral");
+            if !matches!(game.stage, Stage::Lobby | Stage::Ended) {
+                return Err(anyhow!("狼人杀正在进行中"));
             }
-        }
-        Ok(())
-    }
-
-    /// Fired when **the bot itself** is pulled into a new group. Posts a
-    /// public welcome card so the room knows what just got added and how to
-    /// kick off a game without anyone having to read README.
-    ///
-    /// Multi-tenancy: all game state is keyed by `chat_id`, so a single
-    /// bot deployment serves any number of groups concurrently. Combined
-    /// with leaving `ALLOWED_CHAT_ID` unset, this handler is the entire
-    /// "drop bot in any group, it just works" experience.
-    pub async fn handle_bot_added(self: Arc<Self>, evt: BotAdded) -> Result<()> {
-        if self.is_duplicate_event(&evt.event_id) {
-            return Ok(());
-        }
-        // Honour the ALLOWED_CHAT_ID lock for backwards compat — single-group
-        // operators who set this env clearly don't want the bot acting on
-        // unrelated groups even if Feishu accidentally drops it into one.
-        if let Some(allowed) = &self.cfg.allowed_chat_id {
-            if &evt.chat_id != allowed {
-                info!(chat_id = %evt.chat_id, "bot added to non-allowed chat, ignoring");
-                return Ok(());
-            }
-        }
-        let card = build_bot_added_welcome_card(self.llm.is_some(), &evt.operator_open_id);
-        if let Err(e) = self
+            game.start_game()?;
+            let start = crate::werewolf::cards::build_game_start_card(game);
+            let reveals = game
+                .players
+                .iter()
+                .map(|p| {
+                    (
+                        p.open_id.clone(),
+                        crate::werewolf::cards::build_role_reveal_card(game, p),
+                        p.is_ai,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.persist_wolf_locked(chat_id, game);
+            (start, reveals)
+        };
+        self.refresh_lobby(chat_id).await?;
+        let _ = self
             .client
-            .send_message("chat_id", &evt.chat_id, "interactive", &card)
-            .await
-        {
-            warn!(?e, chat_id = %evt.chat_id, "failed to send bot-added welcome");
+            .send_message("chat_id", chat_id, "interactive", &start_card)
+            .await;
+        for (id, card, is_ai) in reveals {
+            if !is_ai {
+                let _ = self.client.send_ephemeral_card(chat_id, &id, &card).await;
+            }
+        }
+        self.advance_wolf(chat_id).await;
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_lobby(&self, chat_id: &str) -> Result<()> {
+        let (value, old_id) = {
+            let games = self.wolf_games.lock();
+            let Some(game) = games.get(chat_id) else {
+                return Ok(());
+            };
+            (build_lobby_card(game), game.lobby_msg_id.clone())
+        };
+        if let Some(id) = old_id {
+            if self.client.update_card(&id, &value).await.is_ok() {
+                return Ok(());
+            }
+        }
+        let id = self
+            .client
+            .send_message("chat_id", chat_id, "interactive", &value)
+            .await?;
+        if let Some(game) = self.wolf_games.lock().get_mut(chat_id) {
+            game.lobby_msg_id = Some(id);
+            self.persist_wolf_locked(chat_id, game);
         }
         Ok(())
     }
 
     pub async fn handle_card_action(self: Arc<Self>, action: CardAction) -> Result<Value> {
-        // Two layers of dedup. event_id catches Feishu's same-id retries;
-        // the action fingerprint catches the trickier case where the same
-        // click is re-delivered with a different event_id.
         if self.is_duplicate_event(&action.event_id) || self.is_duplicate_action(&action) {
             return Ok(json!({}));
         }
         let Some(action_id) = action
             .value
             .get("action")
-            .and_then(|v| v.as_str())
-            .map(String::from)
+            .and_then(Value::as_str)
+            .map(str::to_string)
         else {
             return Ok(json!({}));
         };
-
-        // 狼人杀按钮：所有以 `wolf_` 开头的 action 全部交给狼人杀 handlers。
         if action_id.starts_with("wolf_") {
             return self.handle_wolf_card_action(action, action_id).await;
         }
-
         let chat_id = action
             .value
             .get("chat_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or(action.open_chat_id.clone());
-
-        // Lobby buttons: anyone in the chat can click. Spawn the work and
-        // return immediately so the webhook responds inside Feishu's timeout.
-        if matches!(
-            action_id.as_str(),
-            "join_lobby"
-                | "leave_lobby"
-                | "start_lobby"
-                | "start_lobby_short"
-                | "start_wolf_lobby"
-                | "join_ai_lobby"
-                | "remove_ai_lobby"
-                | "reset_lobby"
-        ) {
-            let bot = self.clone();
-            let aid = action_id.clone();
-            let oid = action.open_id.clone();
-            let cid = chat_id.clone();
-            tokio::spawn(async move {
-                let res = match aid.as_str() {
-                    "join_lobby" => {
-                        let name = bot
-                            .client
-                            .user_name(&oid)
-                            .await
-                            .unwrap_or_else(|_| "玩家".into());
-                        bot.do_join(&cid, &oid, &name).await
-                    }
-                    "leave_lobby" => bot.do_leave(&cid, &oid).await,
-                    "start_lobby" => bot.do_start(&cid, DeckMode::Standard).await,
-                    "start_lobby_short" => bot.do_start(&cid, DeckMode::ShortDeck).await,
-                    "start_wolf_lobby" => bot.do_start_wolf(&cid).await,
-                    "join_ai_lobby" => bot.do_join_ai(&cid).await,
-                    "remove_ai_lobby" => bot.do_remove_ai(&cid).await,
-                    "reset_lobby" => bot.do_reset(&cid).await,
-                    _ => Ok(()),
-                };
-                if let Err(e) = res {
-                    let c = card(
-                        header("⚠️ 无法执行", "red"),
-                        vec![div_md(&format!("{e}"))],
-                    );
-                    let _ = bot.client.send_ephemeral_card(&cid, &oid, &c).await;
-                }
-            });
-            return Ok(json!({}));
-        }
-
-        // Game-action buttons (fold/check/call/raise/allin) need stale-click +
-        // actor-authorization checks before mutating state.
-        let actor_id = action
-            .value
-            .get("actor")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_default();
-        let hand = action.value.get("hand").and_then(|v| v.as_u64()).unwrap_or(0);
-
-        // Stale-click guards. Run *before* the actor check so re-clicking an
-        // old ephemeral card surfaces a clear "this card is stale" toast
-        // rather than "现在不是你的回合", which reads as authorization failure.
-        {
-            let games = self.games.lock();
-            if let Some(g) = games.get(&chat_id) {
-                if hand != 0 && hand as u32 != g.hand_count {
-                    return Ok(toast("这是上一局的按钮"));
-                }
-                if !actor_id.is_empty() {
-                    match g.stage {
-                        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River => {
-                            if let Some(current) = g.current_player_open_id() {
-                                if current != actor_id {
-                                    return Ok(toast(
-                                        "这张卡片已失效 · 最新行动卡在下方",
-                                    ));
-                                }
-                            }
-                        }
-                        Stage::Lobby | Stage::Ended | Stage::Showdown => {
-                            return Ok(toast(
-                                "本局已结束 · 点大厅卡 [开局] 开始新一局",
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Authorization: someone other than the rendered actor clicked a
-        // currently-valid card.
-        if !actor_id.is_empty() && action.open_id != actor_id {
-            return Ok(toast("现在不是你的回合"));
-        }
-
-        let player_action = match action_id.as_str() {
-            "fold" => PlayerAction::Fold,
-            "check" => PlayerAction::Check,
-            "call" => PlayerAction::Call,
-            "allin" => PlayerAction::AllIn,
-            "raise" => {
-                let to = action
-                    .value
-                    .get("to")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if to == 0 {
-                    return Ok(toast("加注金额无效"));
-                }
-                PlayerAction::RaiseTo(to)
-            }
-            "raise_custom" => {
-                // Form-submit button — value carries the action id, the typed
-                // amount lives in form_value.raise_to (a string).
-                let raw = action
-                    .form_value
-                    .get("raise_to")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let to: u64 = match raw.parse() {
-                    Ok(n) if n > 0 => n,
-                    _ => return Ok(toast("请输入有效的加注金额")),
-                };
-                PlayerAction::RaiseTo(to)
-            }
-            _ => return Ok(json!({})),
-        };
-
-        // Apply action synchronously (fast); collect outcome+snapshot.
-        let result = {
-            let mut games = self.games.lock();
-            let g = games
-                .get_mut(&chat_id)
-                .ok_or_else(|| anyhow!("game missing"))?;
-            match g.act(&action.open_id, player_action) {
-                Ok(outcome) => {
-                    self.persist_locked(&chat_id, g);
-                    Ok((outcome, snapshot(g)))
-                }
-                Err(e) => Err(e),
-            }
-        };
-
-        let (outcome, snap) = match result {
-            Ok(v) => v,
-            Err(e) => return Ok(toast(&format!("{e}"))),
-        };
-
-        // Spawn the message-posting so we respond fast.
+            .and_then(Value::as_str)
+            .unwrap_or(&action.open_chat_id)
+            .to_string();
         let bot = self.clone();
-        let cid = chat_id.clone();
+        let oid = action.open_id.clone();
         tokio::spawn(async move {
-            bot.post_action_outcome(&cid, snap, outcome).await;
+            let result = match action_id.as_str() {
+                "join_lobby" => {
+                    let name = bot
+                        .client
+                        .user_name(&oid)
+                        .await
+                        .unwrap_or_else(|_| "玩家".into());
+                    bot.do_join(&chat_id, &oid, &name).await
+                }
+                "leave_lobby" => bot.do_leave(&chat_id, &oid).await,
+                "fill_ai_lobby" => bot.fill_ai_lobby(&chat_id).await,
+                "start_wolf_lobby" => bot.do_start_wolf(&chat_id).await,
+                "reset_lobby" => bot.do_reset(&chat_id).await,
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
+                let _ = bot
+                    .client
+                    .send_ephemeral_card(
+                        &chat_id,
+                        &oid,
+                        &card(header("无法执行", "red"), vec![div_md(&e.to_string())]),
+                    )
+                    .await;
+            }
         });
         Ok(json!({}))
     }
 
-    async fn post_action_outcome(&self, chat_id: &str, snap: GameSnapshot, outcome: ActOutcome) {
-        let hand_ended = outcome.summary.is_some();
-        self.publish_action_messages(chat_id, &snap, &outcome).await;
-        if hand_ended {
-            return;
+    pub async fn handle_member_added(self: Arc<Self>, evt: MemberAdded) -> Result<()> {
+        if self.is_duplicate_event(&evt.event_id) {
+            return Ok(());
         }
-        self.advance_actor(chat_id).await;
+        if self
+            .cfg
+            .allowed_chat_id
+            .as_ref()
+            .is_some_and(|id| id != &evt.chat_id)
+        {
+            return Ok(());
+        }
+        for user in evt.users {
+            let c = card(
+                header("🐺 欢迎来到狼人杀", "turquoise"),
+                vec![
+                    markdown(&format!("👋 **{}**，点击下方按钮加入房间。", user.name)),
+                    button(
+                        "加入狼人杀",
+                        json!({"action":"join_lobby","chat_id":evt.chat_id}),
+                        "primary",
+                    ),
+                ],
+            );
+            let _ = self
+                .client
+                .send_ephemeral_card(&evt.chat_id, &user.open_id, &c)
+                .await;
+        }
+        Ok(())
     }
 
-    /// Just the messaging side of `post_action_outcome` — public action card,
-    /// stage cards, summary on hand end. Doesn't touch actor scheduling so it
-    /// can be reused inside `advance_actor` after each AI move.
-    async fn publish_action_messages(
-        &self,
-        chat_id: &str,
-        snap: &GameSnapshot,
-        outcome: &ActOutcome,
-    ) {
+    pub async fn handle_bot_added(self: Arc<Self>, evt: BotAdded) -> Result<()> {
+        if self.is_duplicate_event(&evt.event_id) {
+            return Ok(());
+        }
+        if self
+            .cfg
+            .allowed_chat_id
+            .as_ref()
+            .is_some_and(|id| id != &evt.chat_id)
+        {
+            return Ok(());
+        }
+        let c = build_bot_added_welcome_card(self.llm.is_some(), &evt.operator_open_id);
         let _ = self
             .client
-            .send_message(
-                "chat_id",
-                chat_id,
-                "interactive",
-                &build_action_announcement(snap, &outcome.log),
-            )
+            .send_message("chat_id", &evt.chat_id, "interactive", &c)
             .await;
-
-        if let Some((stage, cards)) = &outcome.stage_cards {
-            let _ = self.post_stage_card(chat_id, *stage, cards, snap).await;
-        }
-        for (stage, cards) in &outcome.extra_stages {
-            let _ = self.post_stage_card(chat_id, *stage, cards, snap).await;
-        }
-
-        if let Some(summary) = &outcome.summary {
-            let _ = self.post_summary(chat_id, snap, summary).await;
-            // Hand ended. The previous lobby card is now buried under action /
-            // stage / summary cards, so drop its id and post a fresh one so the
-            // next-hand buttons are visible at the bottom of the chat.
-            if let Some(g) = self.games.lock().get_mut(chat_id) {
-                g.lobby_msg_id = None;
-                self.persist_locked(chat_id, g);
-            }
-            let _ = self.refresh_lobby(chat_id).await;
-        }
-    }
-
-    /// Walk forward through any consecutive AI seats. The loop terminates as
-    /// soon as we hit a human (we post their ephemeral action card and wait
-    /// for their button click) or the hand ends.
-    async fn advance_actor(&self, chat_id: &str) {
-        loop {
-            let actor_info = {
-                let games = self.games.lock();
-                let Some(g) = games.get(chat_id) else { return; };
-                if !matches!(
-                    g.stage,
-                    Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
-                ) {
-                    return;
-                }
-                g.players
-                    .get(g.current_idx)
-                    .map(|p| (p.open_id.clone(), p.is_ai))
-            };
-            let Some((actor_id, is_ai)) = actor_info else { return; };
-
-            if !is_ai {
-                let _ = self.post_actor_prompt(chat_id).await;
-                return;
-            }
-
-            // AI seat — pause briefly so the chat doesn't feel robotic, then
-            // ask the LLM and apply the action.
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            let decision = self.ai_decide(chat_id, &actor_id).await;
-            let result = {
-                let mut games = self.games.lock();
-                let Some(g) = games.get_mut(chat_id) else { return; };
-                let r = g
-                    .act(&actor_id, decision.action)
-                    .map(|outcome| (outcome, snapshot(g)));
-                if r.is_ok() {
-                    self.persist_locked(chat_id, g);
-                }
-                r
-            };
-            match result {
-                Ok((outcome, snap)) => {
-                    let hand_ended = outcome.summary.is_some();
-                    let actor = snap.players.iter().find(|p| p.open_id == actor_id);
-                    let actor_name = actor
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| actor_id.clone());
-                    let actor_persona = actor.and_then(|p| p.persona);
-                    self.publish_action_messages(chat_id, &snap, &outcome).await;
-                    if let Some(quip) = decision.quip {
-                        self.post_ai_quip(chat_id, actor_persona, &actor_name, &quip)
-                            .await;
-                    }
-                    if hand_ended {
-                        return;
-                    }
-                    // continue loop — possibly another AI is up next
-                }
-                Err(e) => {
-                    warn!(?e, ai = %actor_id, "AI action rejected, bailing");
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Build the LLM context (with a fresh equity Monte Carlo) and ask the
-    /// model. With no LLM configured, plays a safe default (check or fold)
-    /// and never quips.
-    async fn ai_decide(&self, chat_id: &str, ai_id: &str) -> AiDecision {
-        let Some(ctx) = self.build_ai_context(chat_id, ai_id) else {
-            return AiDecision { action: PlayerAction::Fold, quip: None };
-        };
-        match &self.llm {
-            Some(llm) => llm.decide(&ctx).await,
-            None => {
-                let action = if ctx.to_call == 0 {
-                    PlayerAction::Check
-                } else {
-                    PlayerAction::Fold
-                };
-                AiDecision { action, quip: None }
-            }
-        }
-    }
-
-    /// Post the AI's in-character one-liner as a `post` (rich text) message:
-    /// persona emoji prefix, bolded AI name, then the quip. Card variants all
-    /// looked too heavy for a single short line; rich text gives just enough
-    /// styling (bold name) without any card chrome. Best-effort — failures
-    /// are swallowed.
-    async fn post_ai_quip(
-        &self,
-        chat_id: &str,
-        persona: Option<Persona>,
-        ai_name: &str,
-        quip: &str,
-    ) {
-        let prefix = persona.map(|p| p.emoji()).unwrap_or("💬");
-        let content = serde_json::json!({
-            "zh_cn": {
-                "title": "",
-                "content": [[
-                    { "tag": "text", "text": format!("{prefix} ") },
-                    { "tag": "text", "text": ai_name, "style": ["bold"] },
-                    { "tag": "text", "text": format!("：{quip}") },
-                ]]
-            }
-        });
-        if let Err(e) = self
-            .client
-            .send_message("chat_id", chat_id, "post", &content)
-            .await
         {
-            warn!(?e, %chat_id, "failed to post AI quip");
+            let mut games = self.wolf_games.lock();
+            let game = games
+                .entry(evt.chat_id.clone())
+                .or_insert_with(|| WolfGame::new(evt.chat_id.clone()));
+            self.persist_wolf_locked(&evt.chat_id, game);
         }
+        self.refresh_lobby(&evt.chat_id).await?;
+        Ok(())
     }
 
-    fn build_ai_context(&self, chat_id: &str, ai_id: &str) -> Option<DecisionContext> {
-        let (mut ctx, n_opp) = {
-            let games = self.games.lock();
-            let g = games.get(chat_id)?;
-            let p_idx = g.players.iter().position(|p| p.open_id == ai_id)?;
-            let p = &g.players[p_idx];
-            let n_opp = g
-                .players
-                .iter()
-                .filter(|op| !op.folded && !op.sat_out && op.open_id != ai_id)
-                .count();
-            let others = g
-                .players
-                .iter()
-                .filter(|op| op.open_id != ai_id)
-                .map(|op| {
-                    let status = if op.folded {
-                        "弃牌"
-                    } else if op.all_in {
-                        "全押"
-                    } else if op.sat_out {
-                        "出局"
-                    } else {
-                        "活跃"
-                    };
-                    format!(
-                        "{}: 筹码 {}, 本轮 {}, 状态 {}",
-                        op.name, op.chips, op.bet_in_round, status
-                    )
-                })
-                .collect::<Vec<_>>();
-            let history = g
-                .action_log
-                .iter()
-                .map(|log| {
-                    let actor = &g.players[log.player_idx];
-                    let label = match log.kind {
-                        ActionKind::Fold => "弃牌".to_string(),
-                        ActionKind::Check => "过牌".to_string(),
-                        ActionKind::Call => format!("跟注到 {}", log.amount),
-                        ActionKind::Bet => format!("下注 {}", log.amount),
-                        ActionKind::Raise => format!("加注到 {}", log.amount),
-                        ActionKind::AllIn => format!("全押 {}", log.amount),
-                    };
-                    format!("{}: {}", actor.name, label)
-                })
-                .collect::<Vec<_>>();
-            let ctx = DecisionContext {
-                mode: g.mode,
-                stage: g.stage.label().to_string(),
-                hand_count: g.hand_count,
-                pot: g.pot_total(),
-                current_bet: g.current_bet,
-                big_blind: g.big_blind,
-                my_name: p.name.clone(),
-                my_stack: p.chips,
-                my_bet_in_round: p.bet_in_round,
-                to_call: g.current_bet.saturating_sub(p.bet_in_round),
-                my_max_to: p.chips + p.bet_in_round,
-                min_raise_to: (g.current_bet + g.min_raise).max(g.big_blind),
-                hole: p.hole.clone(),
-                community: g.community.clone(),
-                equity: None,
-                persona: p.persona,
-                others,
-                history,
-            };
-            (ctx, n_opp)
+    pub async fn send_debug_lobby(&self, chat_id: &str, recipient: &str) -> Result<()> {
+        self.refresh_lobby(chat_id).await?;
+        let value = {
+            let games = self.wolf_games.lock();
+            games
+                .get(chat_id)
+                .map(build_lobby_card)
+                .unwrap_or_else(|| build_lobby_card(&WolfGame::new(chat_id.to_string())))
         };
-
-        // Equity is the slow part — compute outside the lock.
-        if !ctx.hole.is_empty() && n_opp > 0 {
-            ctx.equity = Some(crate::poker::equity(
-                &ctx.hole,
-                &ctx.community,
-                n_opp,
-                2000,
-                ctx.mode,
-            ));
-        }
-        Some(ctx)
-    }
-
-    /// Send the action card (full state + buttons) only to the player whose
-    /// turn it is, as an ephemeral group message. The snapshot used here is
-    /// rebuilt under the lock so it carries the actor's hole cards — the
-    /// caller's snapshot might not have them.
-    async fn post_actor_prompt(&self, chat_id: &str) -> Result<()> {
-        let prep = {
-            let games = self.games.lock();
-            let Some(g) = games.get(chat_id) else { return Ok(()); };
-            let Some(actor_id) = g.current_player_open_id().map(String::from) else {
-                return Ok(());
-            };
-            let snap = snapshot_for(g, Some(&actor_id));
-            let n_opp = g
-                .players
-                .iter()
-                .filter(|p| !p.folded && !p.sat_out && p.open_id != actor_id)
-                .count();
-            Some((snap, actor_id, n_opp))
-        };
-        let Some((snap, actor_id, n_opp)) = prep else { return Ok(()); };
-
-        // Compute equity outside the lock — Monte Carlo is ~50–250ms.
-        let stats = compute_viewer_stats(&snap, &actor_id, n_opp);
-        let card = build_state_card(&snap, stats.as_ref(), true);
         self.client
-            .send_ephemeral_card(chat_id, &actor_id, &card)
+            .send_ephemeral_card(chat_id, recipient, &value)
             .await?;
         Ok(())
     }
 
-    async fn post_stage_card(
-        &self,
-        chat_id: &str,
-        stage: Stage,
-        new_cards: &[crate::poker::Card],
-        snap: &GameSnapshot,
-    ) -> Result<()> {
-        let template = match stage {
-            Stage::Flop => "indigo",
-            Stage::Turn => "violet",
-            Stage::River => "carmine",
-            _ => "blue",
-        };
-        let mut elements = vec![
-            markdown("**新增公共牌**"),
-            cards_row(new_cards),
-        ];
-        if snap.community.len() > new_cards.len() {
-            elements.push(markdown("**全部公共牌**"));
-            elements.push(cards_row(&snap.community));
-        }
-        let c = card(
-            header_with_subtitle(
-                &format!("🂠 {}", stage.label()),
-                &format!("底池 {}", snap.pot),
-                template,
-            ),
-            elements,
-        );
-        self.client
-            .send_message("chat_id", chat_id, "interactive", &c)
-            .await?;
-        Ok(())
-    }
-
-    /// Debug: 构造一个 8 玩家（4 真人 + 4 AI）的代表性大厅快照，把按钮换行 /
-    /// 间距 / 配色 在真实卡片上跑一遍，发到 `recipient_open_id` 的 ephemeral。
-    /// 用法：`lark-arena --debug-lobby <name|open_id>`，迭代 UI 不需要重新部署。
-    ///
-    /// 真人玩家的 open_id 全部用 recipient 自己 + bot 自己（display_name 会渲染
-    /// 成 `<at>` 标签，飞书校验里假 open_id 会触发 18054 internal error）。
-    pub async fn send_debug_lobby(
-        &self,
-        chat_id: &str,
-        recipient_open_id: &str,
-    ) -> Result<()> {
-        // 用 bot 自己的 open_id 作为"另一个真人"占位，保证所有 <at id> 都能解析。
-        let bot_oid = self
-            .bot_open_id_clone()
-            .unwrap_or_else(|| recipient_open_id.to_string());
-
-        let mk = |id: &str, name: &str, chips: u64, is_ai: bool| PlayerSnapshot {
-            open_id: id.into(),
-            name: name.into(),
-            chips,
-            bet_in_round: 0,
-            folded: false,
-            all_in: false,
-            sat_out: false,
-            is_ai,
-            persona: if is_ai { Some(Persona::random()) } else { None },
-        };
-        // 8 玩家 → 触发"加入 / 加入 AI / 移除 AI / 离开 / 重置 / 开始德州 /
-        // 短牌德州 / 开始狼人杀" 8 个按钮，最容易看出移动端换行效果。
-        // 4 个 AI 用合成 ai:N（不进 <at>，display_name 会用 emoji+加粗渲染）。
-        let snap = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::Lobby,
-            hand_count: 0,
-            community: vec![],
-            pot: 0,
-            current_bet: 0,
-            min_raise: 10,
-            big_blind: 10,
-            dealer_idx: 0,
-            current_open_id: None,
-            players: vec![
-                mk(recipient_open_id, "你", 1000, false),
-                mk(&bot_oid, "玩家 2", 1000, false),
-                mk(recipient_open_id, "玩家 3", 1000, false),
-                mk(&bot_oid, "玩家 4", 1000, false),
-                mk("ai:1", "莽哥 #1", 1000, true),
-                mk("ai:2", "老炮 #2", 1000, true),
-                mk("ai:3", "跟注站 #3", 1000, true),
-                mk("ai:4", "头铁 #4", 1000, true),
-            ],
-            viewer_hole: vec![],
-            mode: DeckMode::Standard,
-        };
-        let card_value = build_lobby_card(&snap, true, None);
-        self.client
-            .send_ephemeral_card(chat_id, recipient_open_id, &card_value)
-            .await?;
-        Ok(())
-    }
-
-    async fn post_summary(
-        &self,
-        chat_id: &str,
-        snap: &GameSnapshot,
-        summary: &HandSummary,
-    ) -> Result<()> {
-        // (Display strings switched to at-mentions below — Feishu renders the
-        // user's display name from `<at id=...>` without the bot needing the
-        // contact:user.base:readonly scope.)
-        let mut elements = vec![];
-
-        if !summary.showdowns.is_empty() {
-            elements.push(markdown("**公共牌**"));
-            elements.push(cards_row(&snap.community));
-            elements.push(hr());
-
-            for s in &summary.showdowns {
-                let p = &snap.players[s.player_idx];
-                elements.push(markdown(&format!(
-                    "{} · {}",
-                    display_name(p),
-                    category_name(s.rank.category, snap.mode)
-                )));
-                elements.push(markdown("手牌"));
-                elements.push(cards_row(&s.hole));
-                elements.push(markdown("最佳五张"));
-                elements.push(cards_row(&s.best_five));
-                elements.push(hr());
-            }
-        }
-
-        for (k, payout) in summary.payouts.iter().enumerate() {
-            let pot_label = if k == 0 {
-                "💰 主池".to_string()
-            } else {
-                format!("💰 边池 #{k}")
-            };
-            let winner_names = payout
-                .winners
-                .iter()
-                .map(|i| display_name(&snap.players[*i]))
-                .collect::<Vec<_>>()
-                .join("、");
-            let line = if payout.winners.is_empty() {
-                format!("{} **{}** 筹码 → 无人领取", pot_label, payout.amount)
-            } else {
-                format!(
-                    "{} **{}** 筹码 → {} ({})",
-                    pot_label, payout.amount, winner_names, payout.note
-                )
-            };
-            elements.push(markdown(&line));
-        }
-
-        let chips_line = snap
-            .players
-            .iter()
-            .map(|p| format!("{}: {}", display_name(p), p.chips))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        elements.push(note(&format!(
-            "筹码 — {chips_line}\n点大厅卡片 **开局** 进入下一局"
-        )));
-
-        let c = card(
-            header_with_subtitle(
-                "🏆 牌局结束",
-                &format!("第 {} 局", snap.hand_count),
-                "turquoise",
-            ),
-            elements,
-        );
-        self.client
-            .send_message("chat_id", chat_id, "interactive", &c)
-            .await?;
-        Ok(())
-    }
-
-    /// One-off helper: send a mock of every card type to `chat_id` so the
-    /// shapes can be eyeballed in a real client. `recipient_open_id` receives
-    /// the ephemeral ones (welcome / hole / actor prompt / help / chips / error).
-    pub async fn send_all_mocks(
-        &self,
-        chat_id: &str,
-        recipient_open_id: &str,
-    ) -> Result<()> {
-        use crate::poker::{best_five, Card, Rank, Suit};
-
-        let cli = &self.client;
-        let alice = recipient_open_id.to_string();
-        // Feishu's card validator rejects unknown open_ids inside <at> tags or
-        // person_list. Use the bot's own open_id as the "second player" so
-        // every reference is valid; the at-mention will render as the bot's
-        // display name, which is fine for a visual layout check.
-        let bob = self
-            .bot_open_id_clone()
-            .unwrap_or_else(|| alice.clone());
-
-        let send_label = |idx: u32, name: &str| -> Value {
-            card(
-                header(&format!("🧪 Mock #{}", idx), "grey"),
-                vec![markdown(&format!("**{name}**"))],
-            )
-        };
-
-        let mk = |id: &str, name: &str, chips: u64, bet: u64| PlayerSnapshot {
-            open_id: id.into(),
-            name: name.into(),
-            chips,
-            bet_in_round: bet,
-            folded: false,
-            all_in: false,
-            sat_out: false,
-            is_ai: false,
-            persona: None,
-        };
-        let c = |r: u8, s: Suit| Card { rank: Rank(r), suit: s };
-
-        let mut idx = 0u32;
-        let mut step =
-            |_n: &str| -> u32 { idx += 1; idx };
-
-        // --------- 1. help (ephemeral) ---------
-        let n = step("help");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "/poker help (仅请求者可见)")).await?;
-        let help_card = card(
-            header("德州扑克 帮助", "blue"),
-            vec![
-                markdown(
-                    "**操作方式**：通过卡片按钮，或在群里 @机器人 + 关键词\n\n\
-                     • `join` 加入下一局\n\
-                     • `leave` 离开\n\
-                     • `start` 开局 (≥2 名玩家)\n\
-                     • `state` 当前状态\n\
-                     • `chips` 各玩家筹码\n\
-                     • `reset` 重置牌桌\n\n\
-                     游戏内行动均为卡片按钮：弃牌 / 跟注 / 加注 / 全押。",
-                ),
-                note("初始筹码 1000 · 小盲 5 / 大盲 10 · 手牌以**仅本人可见**的群消息发出"),
-            ],
-        );
-        cli.send_ephemeral_card(chat_id, &alice, &help_card).await?;
-
-        // --------- 2. welcome (ephemeral) ---------
-        let n = step("welcome");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "新成员入群 - 欢迎卡 (仅他可见)")).await?;
-        cli.send_ephemeral_card(chat_id, &alice,
-            &build_welcome_card(chat_id, "Alice")).await?;
-
-        // --------- 3. lobby empty ---------
-        let n = step("lobby empty");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "大厅 - 空桌")).await?;
-        let snap_empty = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::Lobby,
-            hand_count: 0,
-            community: vec![],
-            pot: 0, current_bet: 0, min_raise: 10, big_blind: 10,
-            dealer_idx: 0, current_open_id: None, players: vec![],
-            viewer_hole: vec![],
-            mode: DeckMode::Standard,
-        };
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_empty, true, None)).await?;
-
-        // --------- 4. lobby with 2 waiting ---------
-        let n = step("lobby waiting");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "大厅 - 两位玩家就座 (可点开局)")).await?;
-        let snap_lobby2 = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::Lobby,
-            hand_count: 0,
-            community: vec![],
-            pot: 0, current_bet: 0, min_raise: 10, big_blind: 10,
-            dealer_idx: 0, current_open_id: None,
-            players: vec![mk(&alice, "Alice", 1000, 0), mk(&bob, "Bob", 1000, 0)],
-            viewer_hole: vec![],
-            mode: DeckMode::Standard,
-        };
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby2, true, None)).await?;
-
-        // --------- 5. lobby in-progress ---------
-        let n = step("lobby in-progress");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "大厅 - 牌局进行中 (无按钮)")).await?;
-        let snap_lobby_inprog = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::Flop,
-            hand_count: 1,
-            community: vec![c(10, Suit::Hearts), c(11, Suit::Hearts), c(7, Suit::Clubs)],
-            pot: 60, current_bet: 0, min_raise: 10, big_blind: 10,
-            dealer_idx: 0, current_open_id: Some(alice.clone()),
-            players: vec![mk(&alice, "Alice", 970, 0), mk(&bob, "Bob", 970, 0)],
-            viewer_hole: vec![],
-            mode: DeckMode::Standard,
-        };
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_lobby_card(&snap_lobby_inprog, true, None)).await?;
-
-        // --------- 6. hand start ---------
-        let n = step("hand start");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "牌局开始公告")).await?;
-        let snap_start = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::PreFlop,
-            hand_count: 1,
-            community: vec![],
-            pot: 15, current_bet: 10, min_raise: 10, big_blind: 10,
-            dealer_idx: 0, current_open_id: Some(alice.clone()),
-            players: vec![
-                mk(&alice, "Alice", 995, 5),  // SB
-                mk(&bob, "Bob", 990, 10),     // BB
-            ],
-            viewer_hole: vec![],
-            mode: DeckMode::Standard,
-        };
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_hand_start_card(&snap_start)).await?;
-
-        // --------- 7. hole cards (ephemeral) ---------
-        let n = step("hole cards");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "手牌 (私人临时消息，仅你可见)")).await?;
-        let hole = vec![c(14, Suit::Spades), c(13, Suit::Spades)];
-        let hole_card = card(
-            header_with_subtitle("🂠 你的手牌", "第 1 局", "purple"),
-            vec![cards_row(&hole), note("仅你可见 · 群里其他人看不到")],
-        );
-        cli.send_ephemeral_card(chat_id, &alice, &hole_card).await?;
-
-        // Build mid-flop snapshot used by several mocks below
-        let snap_mid_flop = GameSnapshot {
-            chat_id: chat_id.into(),
-            stage: Stage::Flop,
-            hand_count: 1,
-            community: vec![c(10, Suit::Hearts), c(11, Suit::Hearts), c(7, Suit::Clubs)],
-            pot: 60, current_bet: 20, min_raise: 20, big_blind: 10,
-            dealer_idx: 0, current_open_id: Some(alice.clone()),
-            players: vec![
-                mk(&alice, "Alice", 970, 0),
-                mk(&bob, "Bob", 950, 20),
-            ],
-            // Hole cards for the actor (Alice) so the mock action card shows
-            // the "你的手牌" row.
-            viewer_hole: vec![c(14, Suit::Spades), c(13, Suit::Spades)],
-            mode: DeckMode::Standard,
-        };
-
-        // --------- 8. state - public ---------
-        let n = step("state public");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "状态卡 - 公开版 (无按钮)")).await?;
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_state_card(&snap_mid_flop, None, false)).await?;
-
-        // --------- 9. state - private with form + buttons ---------
-        let n = step("state actor");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "行动卡 - 私人版 (form + input + 按钮)")).await?;
-        let mock_stats = compute_viewer_stats(&snap_mid_flop, &alice, 1);
-        cli.send_ephemeral_card(chat_id, &alice,
-            &build_state_card(&snap_mid_flop, mock_stats.as_ref(), true)).await?;
-
-        // --------- 10. action announcement ---------
-        let n = step("action announce");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "行动公告 - 加注后 (公开)")).await?;
-        let log = ActionLogEntry { player_idx: 0, kind: ActionKind::Raise, amount: 60 };
-        let mut snap_after = snap_mid_flop.clone();
-        snap_after.players[0].bet_in_round = 60;
-        snap_after.players[0].chips = 910;
-        snap_after.pot = 120;
-        snap_after.current_bet = 60;
-        snap_after.current_open_id = Some(bob.clone());
-        cli.send_message("chat_id", chat_id, "interactive",
-            &build_action_announcement(&snap_after, &log)).await?;
-
-        // --------- 11/12/13. stage cards ---------
-        let n = step("flop");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "翻牌 (Flop) - 公共牌方块")).await?;
-        let flop = vec![c(10, Suit::Hearts), c(11, Suit::Hearts), c(7, Suit::Clubs)];
-        self.post_stage_card(chat_id, Stage::Flop, &flop, &snap_mid_flop).await?;
-
-        let n = step("turn");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "转牌 (Turn)")).await?;
-        let mut snap_turn = snap_mid_flop.clone();
-        snap_turn.stage = Stage::Turn;
-        snap_turn.community.push(c(13, Suit::Hearts));
-        let turn = vec![c(13, Suit::Hearts)];
-        self.post_stage_card(chat_id, Stage::Turn, &turn, &snap_turn).await?;
-
-        let n = step("river");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "河牌 (River)")).await?;
-        let mut snap_river = snap_turn.clone();
-        snap_river.stage = Stage::River;
-        snap_river.community.push(c(2, Suit::Diamonds));
-        let river = vec![c(2, Suit::Diamonds)];
-        self.post_stage_card(chat_id, Stage::River, &river, &snap_river).await?;
-
-        // --------- 14. summary (showdown) ---------
-        let n = step("summary");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "摊牌总结")).await?;
-        let alice_hole = vec![c(14, Suit::Spades), c(13, Suit::Spades)];
-        let bob_hole = vec![c(12, Suit::Hearts), c(12, Suit::Diamonds)];
-        let community = snap_river.community.clone();
-        let mut alice7 = alice_hole.clone();
-        alice7.extend(community.iter().copied());
-        let (alice_rank, alice_best) = best_five(&alice7, DeckMode::Standard);
-        let mut bob7 = bob_hole.clone();
-        bob7.extend(community.iter().copied());
-        let (bob_rank, bob_best) = best_five(&bob7, DeckMode::Standard);
-        let winner_idx = if alice_rank > bob_rank { 0 } else { 1 };
-        let winning_rank = if alice_rank > bob_rank { alice_rank } else { bob_rank };
-        let summary = HandSummary {
-            showdowns: vec![
-                ShowdownResult { player_idx: 0, hole: alice_hole, best_five: alice_best, rank: alice_rank },
-                ShowdownResult { player_idx: 1, hole: bob_hole, best_five: bob_best, rank: bob_rank },
-            ],
-            payouts: vec![PotPayout {
-                amount: 120,
-                winners: vec![winner_idx],
-                note: crate::poker::category_name(winning_rank.category, DeckMode::Standard).to_string(),
-            }],
-        };
-        let mut snap_show = snap_river.clone();
-        snap_show.stage = Stage::Showdown;
-        snap_show.pot = 120;
-        snap_show.players[0].chips = 910;
-        snap_show.players[1].chips = 910;
-        if winner_idx == 0 { snap_show.players[0].chips += 120; }
-        else { snap_show.players[1].chips += 120; }
-        self.post_summary(chat_id, &snap_show, &summary).await?;
-
-        // --------- 15. chips (ephemeral) ---------
-        let n = step("chips");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "/poker chips (仅请求者可见)")).await?;
-        let chips_body = format!(
-            "• {} (Alice) — **970** 筹码\n• {} (Bob) — **1030** 筹码",
-            at(&alice), at(&bob),
-        );
-        let chips_card = card(header("筹码", "blue"), vec![markdown(&chips_body)]);
-        cli.send_ephemeral_card(chat_id, &alice, &chips_card).await?;
-
-        // --------- 16. reset ---------
-        let n = step("reset");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "/poker reset 通知 (公开)")).await?;
-        let reset_card = card(
-            header("♻️ 牌桌已重置", "wathet"),
-            vec![markdown("点击下方大厅卡片的 **加入** 按钮重新开始。")],
-        );
-        cli.send_message("chat_id", chat_id, "interactive", &reset_card).await?;
-
-        // --------- 17. error feedback ---------
-        let n = step("error");
-        cli.send_message("chat_id", chat_id, "interactive",
-            &send_label(n, "错误反馈 (仅报错者可见)")).await?;
-        let err_card = card(
-            header("⚠️", "red"),
-            vec![markdown("当前没有牌局")],
-        );
-        cli.send_ephemeral_card(chat_id, &alice, &err_card).await?;
-
-        Ok(())
+    pub async fn send_all_mocks(&self, chat_id: &str, recipient: &str) -> Result<()> {
+        self.send_debug_lobby(chat_id, recipient).await
     }
 }
 
-/// Toast-only response for the card endpoint.
-/// Visual representation of one playing card as a coloured tile.
-/// ♥/♦ get a red background with white text; ♠/♣ get grey background with
-/// the default near-black text — both readable, clearly suit-coded.
-fn card_tile(c: crate::poker::Card) -> Value {
-    use crate::poker::Suit;
-    let label = format!("**{}{}**", c.rank.label(), c.suit.symbol());
-    let (bg, body) = match c.suit {
-        Suit::Hearts | Suit::Diamonds => ("red", heading_md_colored(&label, "white")),
-        _ => ("grey", heading_md(&label)),
-    };
-    tile_column(vec![body], 1, bg)
-}
-
-/// Lay out a row of card tiles. Returns a markdown placeholder for the empty case.
-fn cards_row(cards: &[crate::poker::Card]) -> Value {
-    if cards.is_empty() {
-        return markdown("—");
-    }
-    let cols: Vec<Value> = cards.iter().map(|c| card_tile(*c)).collect();
-    column_set(cols)
-}
-
-pub(crate) fn toast(msg: &str) -> Value {
-    json!({
-        "toast": {
-            "type": "warning",
-            "content": msg,
-        }
-    })
-}
-
-/// Snapshot of a game's public state (no hidden cards) for rendering.
-#[derive(Debug, Clone)]
-pub struct GameSnapshot {
-    pub chat_id: String,
-    pub stage: Stage,
-    pub hand_count: u32,
-    pub community: Vec<crate::poker::Card>,
-    pub pot: u64,
-    pub current_bet: u64,
-    pub min_raise: u64,
-    pub big_blind: u64,
-    pub dealer_idx: usize,
-    pub current_open_id: Option<String>,
-    pub players: Vec<PlayerSnapshot>,
-    /// Hole cards of the user this snapshot is being rendered for. Empty
-    /// unless the snapshot is being shown to a specific player (e.g. their
-    /// own action prompt or a `/poker state` reply).
-    pub viewer_hole: Vec<crate::poker::Card>,
-    /// Deck variant for this hand — short-deck swaps trips/straight and
-    /// flush/full-house ranks, and uses A-6-7-8-9 for the wheel.
-    pub mode: DeckMode,
-}
-
-#[derive(Debug, Clone)]
-pub struct PlayerSnapshot {
-    pub open_id: String,
-    pub name: String,
-    pub chips: u64,
-    pub bet_in_round: u64,
-    pub folded: bool,
-    pub all_in: bool,
-    pub sat_out: bool,
-    pub is_ai: bool,
-    pub persona: Option<Persona>,
-}
-
-/// Render a player's name as either a Feishu @-mention (humans) or a styled
-/// plain name (AI seats — synthetic open_ids would fail the at-id validator).
-pub fn display_name(p: &PlayerSnapshot) -> String {
-    if p.is_ai {
-        format!("🤖 **{}**", p.name)
-    } else {
-        at(&p.open_id)
-    }
-}
-
-fn snapshot(g: &Game) -> GameSnapshot {
-    snapshot_for(g, None)
-}
-
-/// Same as `snapshot` but also captures the named viewer's hole cards so
-/// they can be rendered into an ephemeral card meant only for that user.
-fn snapshot_for(g: &Game, viewer_open_id: Option<&str>) -> GameSnapshot {
-    let viewer_hole = viewer_open_id
-        .and_then(|id| g.players.iter().find(|p| p.open_id == id))
-        .map(|p| p.hole.clone())
-        .unwrap_or_default();
-    GameSnapshot {
-        chat_id: g.chat_id.clone(),
-        stage: g.stage,
-        hand_count: g.hand_count,
-        community: g.community.clone(),
-        pot: g.pot_total(),
-        current_bet: g.current_bet,
-        min_raise: g.min_raise,
-        big_blind: g.big_blind,
-        dealer_idx: g.dealer_idx,
-        current_open_id: g.current_player_open_id().map(String::from),
-        players: g
-            .players
-            .iter()
-            .map(|p| PlayerSnapshot {
-                open_id: p.open_id.clone(),
-                name: p.name.clone(),
-                chips: p.chips,
-                bet_in_round: p.bet_in_round,
-                folded: p.folded,
-                all_in: p.all_in,
-                sat_out: p.sat_out,
-                is_ai: p.is_ai,
-                persona: p.persona,
-            })
-            .collect(),
-        viewer_hole,
-        mode: g.mode,
-    }
-}
-
-fn parse_command(
-    text: &str,
-    mentions: &[Mention],
-    bot_open_id: &str,
-    is_p2p: bool,
-) -> Option<Command> {
+fn parse_command(text: &str, mentions: &[Mention], bot_id: &str, p2p: bool) -> Option<Command> {
     let mut cleaned = text.to_string();
-    let mut mentioned_bot = is_p2p;
-    for m in mentions {
-        if !bot_open_id.is_empty() && m.open_id == bot_open_id {
-            mentioned_bot = true;
+    let mut addressed = p2p;
+    for mention in mentions {
+        if mention.open_id == bot_id {
+            addressed = true;
         }
-        cleaned = cleaned.replace(&m.key, "");
+        cleaned = cleaned.replace(&mention.key, "");
     }
-    // 识别狼人杀前缀：/wolf | /狼 | /狼人杀，或 @bot wolf|狼|狼人 后跟子命令。
-    let trimmed = cleaned.trim_start();
-    if let Some(rest) = trimmed
+    let trimmed = cleaned.trim();
+    let body = if let Some(rest) = trimmed
         .strip_prefix("/wolf")
         .or_else(|| trimmed.strip_prefix("/狼人杀"))
         .or_else(|| trimmed.strip_prefix("/狼"))
     {
-        return parse_wolf_subcommand(rest.trim());
-    }
-    let body_str: String = if let Some(rest) = trimmed.strip_prefix("/poker") {
         rest.trim().to_string()
-    } else if mentioned_bot {
-        cleaned.trim().to_string()
+    } else if addressed {
+        trimmed.to_string()
     } else {
         return None;
     };
-    let body = body_str.to_lowercase();
     let mut parts = body.split_whitespace();
-    let cmd = parts.next()?;
-    // @bot wolf <sub>: 把第一个词当作 namespace 切到狼人杀
-    if matches!(cmd, "wolf" | "狼" | "狼人" | "狼人杀") {
-        let rest = parts.collect::<Vec<_>>().join(" ");
-        return parse_wolf_subcommand(&rest);
-    }
-    Some(match cmd {
-        "join" | "加入" => Command::Join,
-        "leave" | "离开" => Command::Leave,
-        "start" | "begin" | "go" | "开始" => Command::Start,
-        "state" | "status" | "状态" => Command::State,
-        "chips" | "stack" | "筹码" => Command::Chips,
-        "reset" | "重置" => Command::Reset,
-        "help" | "帮助" | "?" => Command::Help,
-        _ => return None,
-    })
-}
-
-/// 解析狼人杀子命令：`join` / `leave` / `start` / `reset` / `help`。
-/// 空字符串等价于 `help`，方便 `/wolf` 单独输入也有反馈。
-fn parse_wolf_subcommand(body: &str) -> Option<Command> {
-    let body = body.to_lowercase();
-    let mut parts = body.split_whitespace();
-    let Some(sub) = parts.next() else {
-        return Some(Command::WolfHelp);
+    let first = parts.next().unwrap_or("").to_lowercase();
+    let sub = if matches!(first.as_str(), "wolf" | "狼" | "狼人" | "狼人杀") {
+        parts.next().unwrap_or("help").to_lowercase()
+    } else {
+        first
     };
-    Some(match sub {
+    Some(match sub.as_str() {
         "join" | "加入" => Command::WolfJoin,
         "leave" | "离开" => Command::WolfLeave,
         "start" | "begin" | "go" | "开始" => Command::WolfStart,
         "reset" | "重置" => Command::WolfReset,
-        "help" | "帮助" | "?" => Command::WolfHelp,
+        "help" | "帮助" | "?" | "" => Command::WolfHelp,
         _ => return None,
     })
 }
 
-/// One-shot welcome shown only to a user who just joined the group. The button
-/// reuses the same `join_lobby` action as the persistent lobby card, so the
-/// click flows through the existing handler.
-fn build_welcome_card(chat_id: &str, name: &str) -> Value {
-    let v = json!({ "action": "join_lobby", "chat_id": chat_id });
-    card(
-        header_with_subtitle(
-            "🎰 欢迎来到牌桌",
-            "群里在玩德州扑克",
-            "turquoise",
-        ),
-        vec![
-            markdown(&format!(
-                "👋 **{name}**，要不要加入下一局？\n\n初始 1000 筹码 · 小盲 5 / 大盲 10 · 手牌仅本人可见"
-            )),
-            button_row(vec![button("加入下一局", v, "primary_filled")]),
-            note("这条消息仅你可见，不想玩可以直接忽略。"),
-        ],
-    )
-}
-
-/// Public welcome card posted into a group the moment the bot is added —
-/// triggered by `im.chat.member.bot.added_v1`. Goal: a player who never
-/// read the README can immediately see what's available and how to start.
-///
-/// Visible to everyone in the group (not ephemeral), because the reaction
-/// "what is this bot" belongs to the whole room, not just the inviter.
-fn build_bot_added_welcome_card(ai_enabled: bool, inviter_open_id: &str) -> Value {
-    let inviter_line = if inviter_open_id.is_empty() {
-        "**夜局** 已加入本群 🎉".to_string()
+fn build_lobby_card(game: &WolfGame) -> Value {
+    let in_progress = !matches!(game.stage, Stage::Lobby | Stage::Ended);
+    let subtitle = if in_progress {
+        format!("狼人杀 · {} · 第 {} 天", game.stage.label(), game.day)
     } else {
-        format!(
-            "感谢 {} 把我拉进群 🎉",
-            at(inviter_open_id)
-        )
+        format!("已就座 {} 人 · 需要 9-12 人", game.players.len())
     };
-    let ai_blurb = if ai_enabled {
-        "· 人不够还能 [加入 AI] 凑桌（DeepSeek/OpenAI 驱动的 LLM 玩家）"
+    let mut elements = vec![markdown(if game.players.is_empty() {
+        "🪑 房间空空如也，点击加入狼人杀。"
     } else {
-        "· 部署方设了 OPENAI_API_KEY 可解锁 AI 凑桌"
-    };
-    card(
-        header_with_subtitle(
-            "🎰🐺 夜局 · 上线",
-            "饭后约一局 · 飞书群里玩德州 + 狼人杀",
-            "turquoise",
-        ),
-        vec![
-            markdown(&inviter_line),
-            hr(),
-            markdown(
-                "**怎么开局**\n\
-                 - `@机器人 帮助` 看完整命令列表\n\
-                 - `/poker` 或 `@机器人 加入` 开德州\n\
-                 - `/wolf` 或 `@机器人 狼` 开狼人杀\n\
-                 - 任何时候 `@机器人 重置` 清空牌桌"
-            ),
-            markdown(
-                "**两种模式简介**\n\
-                 - 🎰 **德州扑克**: 多人持续筹码、边池、全押、6+ 短牌; 初始 1000 筹码\n\
-                 - 🐺 **狼人杀**: 9-12 人板娘; 狼/狼王/预/女/猎/守/民, 屠城规则"
-            ),
-            note(ai_blurb),
-            note("手牌 / 身份 / 投票走 ephemeral 私密卡片, 仅本人可见 · 群聊不刷屏"),
-        ],
-    )
-}
-
-/// 狼人杀状态摘要，给统一大厅卡用。`None` 表示当前没有狼人杀牌局。
-#[derive(Debug, Clone)]
-pub struct WolfLobbyStatus {
-    pub in_progress: bool,
-    pub stage_label: String,
-    pub day: u32,
-}
-
-/// 统一大厅卡：同一个 chat 只发一张卡，跟踪当前共享的玩家名册。
-///
-/// 模式切换通过按钮决定：玩家先 [加入] 进场，然后点 [开始德州] / [短牌] /
-/// [开始狼人杀] 选择本局玩什么。任一模式进行中时全部按钮收起。
-fn build_lobby_card(
-    snap: &GameSnapshot,
-    ai_enabled: bool,
-    wolf: Option<&WolfLobbyStatus>,
-) -> Value {
-    let poker_in_progress = matches!(
-        snap.stage,
-        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River | Stage::Showdown
-    );
-    let wolf_in_progress = wolf.map(|w| w.in_progress).unwrap_or(false);
-    let any_in_progress = poker_in_progress || wolf_in_progress;
-
-    let n = snap.players.len();
-    let subtitle = if poker_in_progress {
-        format!(
-            "🎰 德州第 {} 局 · {} · 底池 {}",
-            snap.hand_count,
-            snap.stage.label(),
-            snap.pot
-        )
-    } else if let Some(w) = wolf {
-        if w.in_progress {
-            format!("🐺 狼人杀 · {} · 第 {} 天", w.stage_label, w.day)
-        } else {
-            format!("已就座 {} 人 · 选择模式开局", n)
-        }
-    } else if snap.hand_count == 0 {
-        format!("已就座 {} 人 · 选择模式开局", n)
-    } else {
-        format!("已就座 {} 人 · 已打过 {} 局德州", n, snap.hand_count)
-    };
-
-    let mut elements: Vec<Value> = vec![];
-
-    if snap.players.is_empty() {
-        elements.push(markdown(
-            "🪑 房间空空如也，点击下方 **加入** 就座。\n选择 [开始德州] 或 [开始狼人杀] 决定本局玩什么。",
-        ));
-    } else {
-        let active_ids: Vec<String> = snap
+        "**当前玩家**"
+    })];
+    if !game.players.is_empty() {
+        let ids = game
             .players
             .iter()
-            .filter(|p| !p.sat_out && !p.is_ai)
+            .filter(|p| !p.is_ai)
             .map(|p| p.open_id.clone())
-            .collect();
-        if !active_ids.is_empty() {
-            elements.push(person_list(&active_ids));
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            elements.push(person_list(&ids));
         }
-
-        // 玩家列表：德州进行中显示筹码 / 状态；其他时候简化成名字 + 标记。
-        let lines: Vec<String> = snap
-            .players
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if poker_in_progress {
-                    let dealer = if i == snap.dealer_idx && snap.hand_count > 0 {
-                        " 🅓"
-                    } else {
-                        ""
-                    };
-                    let status = if p.sat_out {
-                        " 💤"
-                    } else if p.folded {
-                        " ✗"
-                    } else if p.all_in {
-                        " ★"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "• {}{}{} — {} 筹码",
-                        display_name(p),
-                        dealer,
-                        status,
-                        p.chips
-                    )
-                } else {
-                    format!("• {} — {} 筹码", display_name(p), p.chips)
-                }
-            })
-            .collect();
-        elements.push(markdown(&lines.join("\n")));
-    }
-
-    if !any_in_progress {
-        let v_base = json!({ "chat_id": snap.chat_id });
-        let mut roster_buttons = vec![button(
-            "加入",
-            merge(&v_base, &json!({ "action": "join_lobby" })),
-            "primary",
-        )];
-        if ai_enabled {
-            roster_buttons.push(button(
-                "加入 AI",
-                merge(&v_base, &json!({ "action": "join_ai_lobby" })),
-                "default",
-            ));
-            if snap.players.iter().any(|p| p.is_ai) {
-                roster_buttons.push(button(
-                    "移除 AI",
-                    merge(&v_base, &json!({ "action": "remove_ai_lobby" })),
-                    "default",
-                ));
-            }
-        }
-        if !snap.players.is_empty() {
-            roster_buttons.push(button(
-                "离开",
-                merge(&v_base, &json!({ "action": "leave_lobby" })),
-                "default",
-            ));
-        }
-        roster_buttons.push(button(
-            "重置",
-            merge(&v_base, &json!({ "action": "reset_lobby" })),
-            "default",
-        ));
-        elements.push(actions(roster_buttons));
-
-        // 模式选择按钮——根据人数决定哪个模式可点
-        let chip_holders = snap.players.iter().filter(|p| p.chips > 0).count();
-        let poker_ready = chip_holders >= 2;
-        let wolf_ready = (9..=12).contains(&n);
-        if poker_ready || wolf_ready {
-            elements.push(crate::feishu::cards::hr());
-            elements.push(markdown("**选择本局玩什么：**"));
-            let mut mode_buttons = vec![];
-            if poker_ready {
-                mode_buttons.push(button(
-                    "🎰 开始德州",
-                    merge(&v_base, &json!({ "action": "start_lobby" })),
-                    "primary",
-                ));
-                mode_buttons.push(button(
-                    "🎰 短牌德州",
-                    merge(&v_base, &json!({ "action": "start_lobby_short" })),
-                    "default",
-                ));
-            }
-            if wolf_ready {
-                mode_buttons.push(button(
-                    "🐺 开始狼人杀",
-                    merge(&v_base, &json!({ "action": "start_wolf_lobby" })),
-                    "primary",
-                ));
-            }
-            elements.push(actions(mode_buttons));
-        }
-
-        // 提示 hint
-        let mut hints = vec!["德州初始 1000 筹码 · 小盲 5 / 大盲 10".to_string()];
-        if !wolf_ready && n < 9 {
-            hints.push(format!("狼人杀需 9-12 人，还差 {} 人", 9_usize.saturating_sub(n)));
-        } else if !wolf_ready && n > 12 {
-            hints.push("狼人杀最多 12 人".into());
-        }
-        if !poker_ready {
-            hints.push("德州需 ≥ 2 名持筹码玩家".into());
-        }
-        elements.push(note_md(&hints.join(" · ")));
-    } else if poker_in_progress {
-        elements.push(note_md("🎰 德州牌局进行中，结束后可继续选择模式。"));
-    } else if wolf_in_progress {
-        elements.push(note_md("🐺 狼人杀进行中，结束后可继续选择模式。"));
-    }
-
-    let template = if any_in_progress { "wathet" } else { "turquoise" };
-    card(
-        header_with_subtitle("🎲 房间 · 大厅", &subtitle, template),
-        elements,
-    )
-}
-
-/// Render the full game state. If `include_buttons` is true the card also
-/// shows the actor-specific call amount and the action buttons — only ever
-/// rendered into an ephemeral message sent to the actor themselves.
-/// Hero stats embedded into the state card for the viewing player. None when
-/// the snapshot has no hole cards (public state card, or non-player viewer).
-#[derive(Debug, Clone)]
-pub struct ViewerStats {
-    pub equity: f64,
-    pub pot: u64,
-    pub to_call: u64,
-    /// Pretty label for the viewer's current made hand (hole + community).
-    /// `None` pre-flop unless we can describe a pocket pair / suited hand —
-    /// with fewer than 5 known cards there's no real "best five" yet.
-    pub made_hand: Option<String>,
-}
-
-/// Build the equity / pot-odds / EV bundle for a snapshot's viewer. Returns
-/// None if the viewer has no hole cards or no opponents are still in.
-fn compute_viewer_stats(
-    snap: &GameSnapshot,
-    viewer_open_id: &str,
-    n_opponents: usize,
-) -> Option<ViewerStats> {
-    if snap.viewer_hole.is_empty() || n_opponents == 0 {
-        return None;
-    }
-    let in_progress = matches!(
-        snap.stage,
-        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
-    );
-    if !in_progress {
-        return None;
-    }
-    let equity = crate::poker::equity(&snap.viewer_hole, &snap.community, n_opponents, 2000, snap.mode);
-    let to_call = snap
-        .players
-        .iter()
-        .find(|p| p.open_id == viewer_open_id)
-        .map(|p| snap.current_bet.saturating_sub(p.bet_in_round))
-        .unwrap_or(0);
-    let made_hand = describe_made_hand(&snap.viewer_hole, &snap.community, snap.mode);
-    Some(ViewerStats {
-        equity,
-        pot: snap.pot,
-        to_call,
-        made_hand,
-    })
-}
-
-/// Friendly label for the actor's strongest 5-card hand using their hole
-/// cards + the visible community.
-///
-/// - **Pre-flop** (community empty, only 2 hole cards): we can't form a 5-card
-///   hand yet, but a pocket pair / suited / connected starting hand is worth
-///   surfacing because it's exactly what a player thinks about pre-flop.
-/// - **Flop+** (≥ 5 known cards): runs `best_five` and renders
-///   `<category> · <top kicker>` — e.g. `两对 · A`, `葫芦 · K`, `同花 · A`.
-///   For straight / straight-flush variants we use the straight's high card,
-///   which is what the kicker stores.
-fn describe_made_hand(hole: &[Card], community: &[Card], mode: DeckMode) -> Option<String> {
-    if hole.len() < 2 {
-        return None;
-    }
-    let total = hole.len() + community.len();
-    if total < 5 {
-        // Pre-flop labelling: only fire on signal-rich starting hands so we
-        // don't drown players in obvious "高牌 K" lines every preflop.
-        if hole[0].rank == hole[1].rank {
-            return Some(format!("口袋对 · **{}**", hole[0].rank.label()));
-        }
-        let suited = hole[0].suit == hole[1].suit;
-        let r1 = hole[0].rank.0 as i16;
-        let r2 = hole[1].rank.0 as i16;
-        let connected = (r1 - r2).abs() == 1;
-        match (suited, connected) {
-            (true, true) => Some("同花连张".into()),
-            (true, false) => Some("同花".into()),
-            (false, true) => Some("连张".into()),
-            (false, false) => None,
-        }
-    } else {
-        let mut all: Vec<Card> = Vec::with_capacity(total);
-        all.extend_from_slice(hole);
-        all.extend_from_slice(community);
-        let (rank, _) = best_five(&all, mode);
-        let cat = category_name(rank.category, mode);
-        let primary = rank.kickers[0];
-        if primary >= 2 && primary <= 14 {
-            let label = match primary {
-                14 => "A".to_string(),
-                13 => "K".to_string(),
-                12 => "Q".to_string(),
-                11 => "J".to_string(),
-                n => n.to_string(),
-            };
-            Some(format!("**{}** · {}", cat, label))
-        } else {
-            Some(format!("**{}**", cat))
-        }
-    }
-}
-
-fn build_state_card(snap: &GameSnapshot, stats: Option<&ViewerStats>, include_buttons: bool) -> Value {
-    let actor = snap.current_open_id.as_deref();
-
-    let subtitle = format!(
-        "第 {} 局 · {} · 底池 {} · 当前注 {}",
-        snap.hand_count, snap.stage.label(), snap.pot, snap.current_bet
-    );
-
-    let mut elements: Vec<Value> = vec![];
-
-    if !snap.community.is_empty() {
-        elements.push(markdown("**公共牌**"));
-        elements.push(cards_row(&snap.community));
-    }
-
-    let player_lines: Vec<String> = snap
-        .players
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let marker = if Some(p.open_id.as_str()) == actor {
-                "▶"
-            } else if p.folded {
-                "✗"
-            } else if p.all_in {
-                "★"
-            } else if p.sat_out {
-                "💤"
-            } else {
-                "•"
-            };
-            let dealer = if i == snap.dealer_idx { " 🅓" } else { "" };
-            format!(
-                "{} {}{} — {} 筹码 (本轮 {})",
-                marker, display_name(p), dealer, p.chips, p.bet_in_round
-            )
-        })
-        .collect();
-    elements.push(markdown(&player_lines.join("\n")));
-
-    let in_progress = matches!(
-        snap.stage,
-        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
-    );
-
-    if include_buttons {
-        if let Some(open_id) = actor {
-            let p_idx = snap
+        elements.push(markdown(
+            &game
                 .players
                 .iter()
-                .position(|p| p.open_id == open_id)
-                .unwrap_or(0);
-            let p = &snap.players[p_idx];
-            let to_call = snap.current_bet.saturating_sub(p.bet_in_round);
-            elements.push(hr());
-
-            // Always re-surface the actor's own hole cards on their action
-            // card so they don't have to scroll up to the original ephemeral.
-            if !snap.viewer_hole.is_empty() {
-                elements.push(markdown("**你的手牌**"));
-                elements.push(cards_row(&snap.viewer_hole));
-            }
-
-            // Equity / pot odds / naive call EV. Computed off the lock and
-            // passed in via `stats`.
-            if let Some(s) = stats {
-                elements.push(markdown(&render_stats_line(s)));
-            }
-
-            elements.push(markdown(&format!(
-                "🎯 **你的回合** · 剩余筹码 **{}** · 需要跟注 **{}**",
-                p.chips, to_call
+                .map(|p| {
+                    format!(
+                        "• {}{}",
+                        if p.is_ai {
+                            p.persona.map(|x| x.emoji()).unwrap_or("🤖")
+                        } else {
+                            "👤"
+                        },
+                        p.name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    if !in_progress {
+        let base = json!({"chat_id": game.chat_id});
+        let mut roster = vec![button(
+            "加入",
+            merge(&base, &json!({"action":"join_lobby"})),
+            "primary",
+        )];
+        roster.push(button(
+            "AI 补齐人数",
+            merge(&base, &json!({"action":"fill_ai_lobby"})),
+            "default",
+        ));
+        if !game.players.is_empty() {
+            roster.push(button(
+                "离开",
+                merge(&base, &json!({"action":"leave_lobby"})),
+                "default",
+            ));
+        }
+        roster.push(button(
+            "重置",
+            merge(&base, &json!({"action":"reset_lobby"})),
+            "default",
+        ));
+        elements.push(actions(roster));
+        if (9..=12).contains(&game.players.len()) {
+            elements.push(button(
+                "🐺 开始狼人杀",
+                merge(&base, &json!({"action":"start_wolf_lobby"})),
+                "primary",
+            ));
+        } else {
+            elements.push(note_md(&format!(
+                "还差 {} 人，或点击 AI 补齐人数",
+                9usize.saturating_sub(game.players.len())
             )));
-
-            // Quick actions: Fold + (Check or Call) + All-in
-            elements.push(button_row(quick_action_buttons(snap, p_idx)));
-
-            // Custom raise via input form, plus a row of raise presets
-            if p.chips > to_call {
-                elements.push(raise_form_block(snap, p_idx));
-                let presets = raise_preset_buttons(snap, p_idx);
-                if !presets.is_empty() {
-                    elements.push(button_row(presets));
-                }
-            }
-
-            elements.push(note("仅你可见 · 群里其他人看不到这些按钮"));
-        }
-    } else if in_progress {
-        // Non-actor viewing /poker state: still show their hole cards + equity
-        // so the command is useful even when it's not their turn.
-        if !snap.viewer_hole.is_empty() {
-            elements.push(hr());
-            elements.push(markdown("**你的手牌**"));
-            elements.push(cards_row(&snap.viewer_hole));
-            if let Some(s) = stats {
-                elements.push(markdown(&render_stats_line(s)));
-            }
-        }
-        if let Some(open_id) = actor {
-            if let Some(p) = snap.players.iter().find(|p| p.open_id == open_id) {
-                elements.push(note(&format!("{} 行动中…", display_name(p))));
-            }
         }
     } else {
-        elements.push(note("等待发牌或本局已结束。"));
+        elements.push(note_md("狼人杀进行中，结束后大厅会重新开放。"));
     }
-
     card(
-        header_with_subtitle("🎰 德州扑克", &subtitle, "wathet"),
+        header_with_subtitle(
+            "🐺 狼人杀 · 大厅",
+            &subtitle,
+            if in_progress { "wathet" } else { "turquoise" },
+        ),
         elements,
     )
 }
 
-/// `牌型 两对·A | 胜率 47% · 底池赔率 21% · 跟注 EV +12` — made-hand label
-/// goes first (most actionable info to a human eye-balling the card), then
-/// equity/pot-odds/EV. Pot odds & EV only render when there's a non-zero
-/// call to make. Made-hand only renders when we have one to report.
-fn render_stats_line(s: &ViewerStats) -> String {
-    let mut line = String::new();
-    if let Some(hand) = &s.made_hand {
-        line.push_str(&format!("牌型 {}", hand));
-        line.push_str(" | ");
-    }
-    line.push_str(&format!("胜率 **{:.0}%**", s.equity * 100.0));
-    if s.to_call > 0 {
-        let pot_after = (s.pot + s.to_call) as f64;
-        let pot_odds = s.to_call as f64 / pot_after;
-        let ev = s.equity * pot_after - s.to_call as f64;
-        line.push_str(&format!(
-            " · 底池赔率 **{:.0}%** · 跟注 EV **{:+.0}**",
-            pot_odds * 100.0,
-            ev
-        ));
-    }
-    line
-}
-
-/// Fold + (Check / Call) + All-in. The form-input below handles custom raises.
-///
-/// Visual hierarchy:
-/// - Fold uses `danger_text` — red text, no border, low visual weight.
-/// - Check/Call uses `primary_filled` — solid blue, the prominent main action.
-/// - All-in uses `default` — grey outline, secondary.
-fn quick_action_buttons(snap: &GameSnapshot, idx: usize) -> Vec<Value> {
-    let p = &snap.players[idx];
-    let to_call = snap.current_bet.saturating_sub(p.bet_in_round);
-    let chips = p.chips;
-    let v_base = json!({
-        "chat_id": snap.chat_id,
-        "hand": snap.hand_count,
-        "actor": p.open_id,
-    });
-
-    let mut buttons = vec![button(
-        "弃牌",
-        merge(&v_base, &json!({"action": "fold"})),
-        "danger_text",
-    )];
-
-    if to_call == 0 {
-        buttons.push(button(
-            "过牌",
-            merge(&v_base, &json!({"action": "check"})),
-            "primary_filled",
-        ));
-    } else if chips <= to_call {
-        // Forced all-in (calling would put them all-in or short)
-        buttons.push(button(
-            &format!("全押 {}", chips + p.bet_in_round),
-            merge(&v_base, &json!({"action": "allin"})),
-            "primary_filled",
-        ));
-        return buttons;
+fn build_bot_added_welcome_card(ai_enabled: bool, inviter: &str) -> Value {
+    let ai_note = if ai_enabled {
+        "人数不足时可点击 **AI 补齐人数**。"
     } else {
-        buttons.push(button(
-            &format!("跟注 {}", to_call),
-            merge(&v_base, &json!({"action": "call"})),
-            "primary_filled",
-        ));
-    }
-
-    if chips > to_call {
-        buttons.push(button(
-            &format!("全押 {}", chips + p.bet_in_round),
-            merge(&v_base, &json!({"action": "allin"})),
-            "default",
-        ));
-    }
-    buttons
-}
-
-/// Form container with `加注到 [____]` input + a `确认加注` submit button on the
-/// same row. Submitting the form triggers a `card.action.trigger` callback whose
-/// `event.action.form_value.raise_to` carries the typed amount.
-fn raise_form_block(snap: &GameSnapshot, idx: usize) -> Value {
-    let p = &snap.players[idx];
-    let min_raise_to = (snap.current_bet + snap.min_raise).max(snap.big_blind);
-    let max_to = p.chips + p.bet_in_round;
-    let v = json!({
-        "chat_id": snap.chat_id,
-        "hand": snap.hand_count,
-        "actor": p.open_id,
-        "action": "raise_custom",
-    });
-    form(
-        "raise_form",
-        vec![column_set(vec![
-            column(
-                vec![input_field(
-                    "raise_to",
-                    &format!("{}-{}", min_raise_to, max_to),
-                    &min_raise_to.to_string(),
-                    "加注到",
-                )],
-                3,
-            ),
-            column(
-                vec![submit_button("确认加注", v, "primary_filled")],
-                1,
-            ),
-        ])],
-    )
-}
-
-/// Up to 3 quick raise presets (min raise, half-pot, pot).
-fn raise_preset_buttons(snap: &GameSnapshot, idx: usize) -> Vec<Value> {
-    let p = &snap.players[idx];
-    let min_raise_to = (snap.current_bet + snap.min_raise).max(snap.big_blind);
-    let max_to = p.chips + p.bet_in_round;
-    let v_base = json!({
-        "chat_id": snap.chat_id,
-        "hand": snap.hand_count,
-        "actor": p.open_id,
-    });
-    raise_presets(snap.current_bet, min_raise_to, snap.pot, max_to)
-        .into_iter()
-        .take(3)
-        .map(|to| {
-            let label = if to >= max_to {
-                format!("全押 {}", max_to)
-            } else if to == min_raise_to {
-                format!("最小 {}", to)
-            } else {
-                format!("加到 {}", to)
-            };
-            let action_name = if to >= max_to { "allin" } else { "raise" };
-            let mut v = json!({"action": action_name});
-            if action_name == "raise" {
-                v["to"] = json!(to);
-            }
-            button(&label, merge(&v_base, &v), "default")
-        })
-        .collect()
-}
-
-/// One-shot public card posted at the start of a hand so non-actors immediately
-/// know the hand began, who's in, and who's first to act.
-fn build_hand_start_card(snap: &GameSnapshot) -> Value {
-    let dealer_at = snap
-        .players
-        .get(snap.dealer_idx)
-        .map(display_name)
-        .unwrap_or_else(|| "?".to_string());
-    // Players who actually posted blinds this hand are exactly the ones whose
-    // bet_in_round is positive — derive the names from that, so we don't have
-    // to recompute heads-up vs multi-way blind positions here.
-    let blind_posters: Vec<String> = snap
-        .players
-        .iter()
-        .filter(|p| p.bet_in_round > 0)
-        .map(|p| format!("{} ({})", display_name(p), p.bet_in_round))
-        .collect();
-    let mut body = format!("庄家 {}", dealer_at);
-    if !blind_posters.is_empty() {
-        body.push_str(&format!("\n盲注：{}", blind_posters.join(" · ")));
-    }
-    if let Some(actor_id) = &snap.current_open_id {
-        if let Some(p) = snap.players.iter().find(|p| &p.open_id == actor_id) {
-            body.push_str(&format!("\n↓ 首位 {}", display_name(p)));
-        }
-    }
-    let title = match snap.mode {
-        DeckMode::Standard => format!("🂠 第 {} 局开始", snap.hand_count),
-        DeckMode::ShortDeck => format!("🂠 第 {} 局开始 · 短牌", snap.hand_count),
+        "配置 OPENAI_API_KEY 后可使用 AI 补齐人数。"
     };
     card(
-        header_with_subtitle(
-            &title,
-            &format!("底池 {}", snap.pot),
-            "turquoise",
-        ),
+        header_with_subtitle("🐺 夜局 · 狼人杀", "飞书群里的 AI 狼人杀", "turquoise"),
         vec![
-            markdown(&body),
-            note("行动按钮以**仅当前玩家可见**的方式发出"),
+            markdown(&if inviter.is_empty() {
+                "狼人杀机器人已加入本群。".to_string()
+            } else {
+                format!("感谢 {} 把我拉进群。", at(inviter))
+            }),
+            markdown("点击大厅卡片加入，凑齐 9-12 人后开始。"),
+            note(ai_note),
         ],
     )
-}
-
-/// Public, post-action announcement. Carries enough state info that non-actors
-/// can follow the hand without ever seeing the ephemeral state card.
-fn build_action_announcement(snap: &GameSnapshot, log: &ActionLogEntry) -> Value {
-    let p = &snap.players[log.player_idx];
-    let action = match log.kind {
-        ActionKind::Fold => "弃牌".to_string(),
-        ActionKind::Check => "过牌".to_string(),
-        ActionKind::Call => format!("跟注到 {}", log.amount),
-        ActionKind::Bet => format!("下注 {}", log.amount),
-        ActionKind::Raise => format!("加注到 {}", log.amount),
-        ActionKind::AllIn => format!("全押 {}", log.amount),
-    };
-    let mut subtitle = format!("底池 {}", snap.pot);
-    if !snap.community.is_empty() {
-        subtitle.push_str(&format!(
-            " · 公共 {}",
-            snap.community
-                .iter()
-                .map(|c| c.label())
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-    }
-
-    let mut body = format!(
-        "{} {} (筹码 {})",
-        display_name(p),
-        action,
-        p.chips
-    );
-
-    let in_progress = matches!(
-        snap.stage,
-        Stage::PreFlop | Stage::Flop | Stage::Turn | Stage::River
-    );
-    if in_progress {
-        if let Some(actor_id) = &snap.current_open_id {
-            if actor_id != &p.open_id {
-                if let Some(np) = snap.players.iter().find(|np| &np.open_id == actor_id) {
-                    body.push_str(&format!("\n↓ 下一位 {}", display_name(np)));
-                }
-            }
-        }
-    }
-    card(
-        header_with_subtitle("🎴 行动", &subtitle, "wathet"),
-        vec![markdown(&body)],
-    )
-}
-
-fn raise_presets(current_bet: u64, min_raise_to: u64, pot: u64, max_to: u64) -> Vec<u64> {
-    use std::collections::BTreeSet;
-    let mut s: BTreeSet<u64> = BTreeSet::new();
-    if min_raise_to <= max_to {
-        s.insert(min_raise_to);
-    }
-    let half_pot = current_bet + (pot / 2).max(1);
-    if half_pot >= min_raise_to && half_pot < max_to {
-        s.insert(half_pot);
-    }
-    let pot_raise = current_bet + pot.max(1);
-    if pot_raise >= min_raise_to && pot_raise < max_to {
-        s.insert(pot_raise);
-    }
-    if max_to >= min_raise_to {
-        s.insert(max_to);
-    }
-    s.into_iter().take(4).collect()
 }
 
 fn merge(a: &Value, b: &Value) -> Value {
-    let mut out = a.clone();
-    if let (Some(o), Some(bm)) = (out.as_object_mut(), b.as_object()) {
-        for (k, v) in bm {
-            o.insert(k.clone(), v.clone());
-        }
+    let mut out = a.as_object().cloned().unwrap_or_default();
+    if let Some(obj) = b.as_object() {
+        out.extend(obj.clone());
     }
-    out
+    Value::Object(out)
 }
 
+pub(crate) fn toast(content: &str) -> Value {
+    json!({"toast":{"type":"info","content":content}})
+}
+
+fn ai_seats_needed(player_count: usize) -> usize {
+    9usize.saturating_sub(player_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_fill_targets_minimum_nine_players() {
+        assert_eq!(ai_seats_needed(0), 9);
+        assert_eq!(ai_seats_needed(4), 5);
+        assert_eq!(ai_seats_needed(9), 0);
+        assert_eq!(ai_seats_needed(12), 0);
+    }
+
+    #[test]
+    fn lobby_contains_one_click_ai_fill_action() {
+        let game = WolfGame::new("oc_test".into());
+        let encoded = sonic_rs::to_string(&build_lobby_card(&game)).unwrap();
+        assert!(encoded.contains("AI 补齐人数"));
+        assert!(encoded.contains("fill_ai_lobby"));
+    }
+
+    #[test]
+    fn command_parser_only_accepts_werewolf_namespace() {
+        assert_eq!(
+            parse_command("/wolf join", &[], "", false),
+            Some(Command::WolfJoin)
+        );
+        assert_eq!(parse_command("/unknown join", &[], "", false), None);
+    }
+}

@@ -1,9 +1,8 @@
 mod bot;
 mod config;
 mod feishu;
-mod game;
 mod llm;
-mod poker;
+mod persona;
 mod server;
 mod storage;
 mod util;
@@ -38,10 +37,8 @@ async fn main() -> Result<()> {
         bot.set_bot_open_id(id);
     }
 
-    // One-off `--mock <recipient_open_id>` mode: blast all card mocks to the
-    // configured chat (ALLOWED_CHAT_ID) and exit. The recipient is the user
-    // who will receive ephemeral cards (welcome / hole cards / actor prompt
-    // / help / chips / error feedback) — pass any human open_id in the chat.
+    // One-off `--mock <recipient_open_id>` mode: send the lobby mock to the
+    // configured chat (ALLOWED_CHAT_ID) and exit.
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--mock" {
         let chat_id = bot
@@ -60,7 +57,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `--debug-lobby <name|open_id>`: 把代表性的大厅卡（8 个按钮）作为
+    // `--debug-lobby <name|open_id>`: 把代表性的大厅卡作为
     // ephemeral 发给指定用户。用于在不重新部署的前提下迭代 UI 布局。
     // 参数若以 `ou_` 开头视为 open_id；否则当作群成员姓名查表。
     if args.len() >= 2 && args[1] == "--debug-lobby" {

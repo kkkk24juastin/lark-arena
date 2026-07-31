@@ -1,231 +1,103 @@
-# 夜局 · 飞书群聊 AI 牌局机器人
+# 夜局 · lark-arena
 
-> **夜局**(`lark-arena`)—— 饭后约一局,在飞书群里玩 **德州扑克** + **狼人杀**,人不够用 **AI 玩家**凑（DeepSeek / OpenAI / Doubao 都能接）。一行 docker 起服务,把 bot 拉进任意群,@ 一下就开局。
+飞书群聊里的 AI 狼人杀机器人。支持 9-12 人板娘、私密身份卡、夜间技能、上警、警徽、遗言、猎人/狼王开枪，以及 OpenAI-compatible LLM 驱动的 AI 玩家。
 
-> *Yejú* (lit. "night session", project codename `lark-arena`) is a multi-game arena bot for **Feishu (Lark)** group chats — runs **Texas Hold'em** and **Werewolf / Mafia** sessions where empty seats are filled by **LLM-driven AI players**. Single static binary, JSON 2.0 interactive cards, persistent chip stacks via redb. Drop the bot into any group; it just works.
+## 功能
 
-**关键词 / Keywords**: 飞书机器人, Lark bot, 飞书 AI 玩家, 飞书德州扑克, 飞书狼人杀, 飞书桌游, 群聊游戏, Texas Hold'em poker bot, Werewolf / Mafia game bot, group chat AI agent, LLM poker, DeepSeek bot, Rust + axum.
+- 9 人：3 狼 / 预言家 / 女巫 / 猎人 / 3 村民，不上警
+- 10 人：2 狼 + 狼王 / 预言家 / 女巫 / 猎人 / 守卫 / 3 村民
+- 11 人：2 狼 + 狼王 / 预言家 / 女巫 / 猎人 / 守卫 / 4 村民
+- 12 人：3 狼 + 狼王 / 预言家 / 女巫 / 猎人 / 守卫 / 4 村民
+- 身份、夜间技能和投票通过 ephemeral 卡片发送，仅本人可见
+- 房间和对局状态使用 redb 持久化
+- 大厅支持一键用 AI 补齐到 9 人
+- AI 支持 OpenAI、DeepSeek、Doubao 等 OpenAI-compatible endpoint
 
-## 特性 · Features
+## 配置
 
-- **德州扑克 (Texas Hold'em)**：多玩家、边池 (side pots)、全押 (all-in)、6+ 短牌 (6+ short deck)
-- **狼人杀 (Werewolf / Mafia)**：9-12 人板娘、狼 / 狼王 / 预言家 / 女巫 / 猎人 / 守卫 / 村民、屠城判定、上警警徽流转、自刀策略
-- **AI 玩家 (LLM-driven seats)**：每个 AI 都有人设 (莽哥/老炮/跟注站/老抠/头铁)，跟人打感觉不像跟机器打。可叠加多个，一桌混合人 + AI
-- **卡片 JSON 2.0**：手牌方块、加注 form 输入、按钮分级、ephemeral 私密卡片（仅当前 actor 可见，群里其他人只看公开公告）
-- **持久化**：redb 嵌入式 ACID 数据库，重启不丢筹码 / 不丢身份 / 不丢局
-- **2026 极致性能栈**：Rust 2024 edition · mimalloc 全局 allocator · sonic-rs SIMD JSON · foldhash · fastrand · rayon 并行 Monte Carlo equity · u64 bitmask 7 张直评器 · arc-swap 无锁 token 缓存
+复制 `.env.example` 为 `.env`，至少填写：
 
-## 部署
-
-### 1. 拉镜像并运行
-
-**默认多群模式** —— 机器人会响应所有把它拉进群的飞书群,各群游戏状态独立按 `chat_id` 分桶,互不干扰。
-
-```bash
-docker pull ghcr.io/gtoxlili/lark-arena:latest
-
-docker run -d \
-  --name lark-arena \
-  --restart unless-stopped \
-  -e FEISHU_APP_ID=<your_app_id> \
-  -e FEISHU_APP_SECRET=<your_app_secret> \
-  -e BIND_ADDR=0.0.0.0:8080 \
-  -e RUST_LOG=lark_arena=info,tower_http=info \
-  -e LARK_ARENA_DB_PATH=/data/arena.redb \
-  -v lark-arena-data:/data \
-  -p 8080:8080 \
-  ghcr.io/gtoxlili/lark-arena:latest
+```dotenv
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
 ```
 
-> 想锁单群测试?加上 `-e ALLOWED_CHAT_ID=oc_xxx`,只有那个群的事件被处理,其他群一律忽略。生产部署不建议设这个。
+启用 AI 玩家还需要：
 
-### 2. 飞书后台配置
-
-在 [飞书开放平台](https://open.feishu.cn/app) 新建企业自建应用，添加机器人能力。
-
-**权限管理**(租户级,加完一次所有群通用)
-
-| Scope | 用途 |
-| --- | --- |
-| `im:message:send_as_bot` | 发消息 |
-| `im:message.group_at_msg:readonly` | 接收群里 @ 机器人 |
-| `im:chat:readonly` | 读群成员、用户进群事件 |
-| `contact:contact.base:readonly` | 读真人昵称（否则全部 fallback 成"玩家"，AI 没法分辨谁是谁）|
-
-**事件配置**（事件与回调 → 事件配置）
-
-- 订阅方式：将事件发送至开发者服务器
-- 请求地址：`http://<your-server>:8080/webhook/event`
-- 订阅事件:
-
-| 事件 | 用途 |
-| --- | --- |
-| `im.message.receive_v1` | 接收群里所有 `@机器人 …` / `/poker` / `/wolf` 命令 |
-| `im.chat.member.user.added_v1` | 普通用户进群,bot 给该用户发个 ephemeral 玩法提示 |
-| `im.chat.member.bot.added_v1` | **机器人自己**被拉进新群时,在群里发欢迎卡 + 玩法说明(让群成员立刻知道 bot 能干啥) |
-
-不要在事件配置页订阅 `card.action.trigger`。
-
-**回调配置**（事件与回调 → 回调配置）
-
-- 请求地址：`http://<your-server>:8080/webhook/card`
-- 订阅回调：仅 `card.action.trigger`
-- 删除：`card.action.trigger_v1`、`url.preview.get`、`profile.view.get`
-
-`card.action.trigger_v1` 和 `card.action.trigger` 同时订阅会造成同一次按钮点击发两份回调。
-
-**版本管理与发布**
-
-每次改完订阅或权限都要创建版本并发布。
-
-### 3. 把机器人拉进群
-
-群设置 → 机器人 → 添加机器人。
-
-## 玩法
-
-### 统一大厅
-
-每个群只有一张大厅卡，玩家先点 **[加入]** 入座，再选模式：
-
-- **[🎰 开始德州]** / **[🎰 短牌德州]** — 走德州流程
-- **[🐺 开始狼人杀]** — 走狼人杀流程
-
-人数门槛：
-- 德州：≥ 2 名持筹码玩家
-- 狼人杀：9-12 人（标准板娘）
-
-按钮共用：`[加入]` `[加入 AI]` `[移除 AI]` `[离开]` `[重置]`。任一模式进行中时所有按钮收起，只显示当前游戏状态。
-
-### 文字命令
-
-#### 德州
-
-`/poker <关键词>` 或 `@机器人 <关键词>`：
-
-| 命令 | 说明 |
-| --- | --- |
-| `join` / `加入` | 入桌 |
-| `leave` / `离开` | 离桌（牌局未开始时） |
-| `start` / `开始` | 开局，需 ≥ 2 名持筹码玩家。`start short` 走 6+ 短牌 |
-| `state` / `状态` | 查看当前状态（私下回复） |
-| `chips` / `筹码` | 查看各家筹码（私下回复） |
-| `reset` / `重置` | 重置房间（清空德州+狼人杀） |
-| `help` / `帮助` | 帮助卡 |
-
-短牌：36 张牌（去掉 2-5），同花 > 葫芦、三条 > 顺子，A 低顺是 A-6-7-8-9。
-
-行动按钮只发给当前 actor，仅他可见，包括 `[弃牌] [跟注 X] [全押]` 一行 + 加注 form 输入框 + 三个加注预设。
-
-#### 狼人杀
-
-`/wolf <关键词>` 或 `@机器人 wolf <关键词>` 或 `@机器人 狼 <关键词>`：
-
-| 命令 | 说明 |
-| --- | --- |
-| `join` / `加入` | 入房（同 `/poker join`） |
-| `leave` / `离开` | 离房（同 `/poker leave`） |
-| `start` / `开始` | 开狼人杀，需 9-12 名玩家 |
-| `reset` / `重置` | 重置房间（同 `/poker reset`） |
-| `help` / `帮助` | 狼人杀帮助卡 |
-
-`join` / `leave` / `reset` 在两个命名空间下完全等价——大厅名册是统一的。
-
-**角色配比**：
-
-| 人数 | 角色 |
-| --- | --- |
-| 9 | 3 狼 + 预言家 + 女巫 + 猎人 + 3 村民（不上警） |
-| 10 | 2 狼 + **狼王** + 预言家 + 女巫 + 猎人 + 守卫 + 3 村民 |
-| 11 | 2 狼 + **狼王** + 预言家 + 女巫 + 猎人 + 守卫 + 4 村民 |
-| 12 | 3 狼 + **狼王** + 预言家 + 女巫 + 猎人 + 守卫 + 4 村民 |
-
-**流程**：开局 → 身份 ephemeral → **第 1 夜**（守卫 → 狼刀 → 预言家 → 女巫）→ 黎明公布死讯（夜里死的人**全部静默**，不说遗言）→ **上警阶段**（10+ 人板，仅第 1 天）→ **上警发言**（候选 ≥ 2 时按提名顺序轮流）→ 警长投票 → **警长选警上 / 警下** → **白天轮流发言**（警长末位归票）→ 全员投票放逐 → **放逐者遗言** → 猎人 / 狼王开枪 / 警徽流转 → 检查胜负 → 下一夜 / 结束。
-
-**胜负**（屠城 + 警长例外）：
-- 好人胜：杀光所有狼（含狼王）
-- 狼胜：存活狼 > 存活好人，**或** 1:1 但警长不在好人手上
-- 1:1 时如果好人方还有警长存活（1.5x 票权可在投票中反扑），**不算狼胜，游戏继续**
-
-**关键规则**：
-- **狼王 (10+ 人板)**：狼阵营。被投票放逐时可开枪带走一人；**被毒不能开枪**。预言家查验显示为狼。**公开开枪广播不会标记为"狼王"**（按惯例伪装成猎人），真身在结算 summary 揭晓。
-- **守卫 (10+ 人板)**：每晚守一名玩家（含自己），不可连续两晚守同一人。**同守同救**：被守 + 被救 → 双重保护抵消，依然死亡。
-- **女巫**：救药 / 毒药各 1 瓶，同晚不可救+毒。
-- **猎人**：被狼刀或被放逐时可开枪带走一人。**被毒**不能开枪。
-- **警长 (10+ 人板)**：1.5 倍票权（整数 3 vs 普通 2）；死亡时可移交警徽给存活玩家或撕毁。**警长决定白天发言警上 / 警下方向，本人末位归票**。
-- **死亡遗言**：**只有白天被放逐者有遗言**；夜里死的人（狼刀 / 毒 / 同守同救）全部静默；被开枪带走者也无遗言。猎人 / 狼王临死开枪时由 `dying_hunter_combined` 一次性吐出『一句话+开枪目标』，那一句话同时充当临终信号。
-
-**讨论 / 发言机制**：
-- **狼人夜间** ：
-  - 全 AI 局：跳过讨论，AI 顺序决策后直接结算
-  - 混合 / 全人类局：每只狼收到带聊天的私密行动卡（update_card 原地刷新），AI 也会发表一句协调队友的话；人类可在卡片输入框里发言、改目标、点 [我决定了] 锁定。**全员就绪才结夜**
-- **上警发言（10+ 板，候选 ≥ 2）**：候选人按提名顺序轮流，公开"上警发言卡"显示进度+历史，当前候选人收到私密输入卡（[✅ 说完了] / [⏭ 沉默]）
-- **白天发言**：警长起手顺时针轮流（无警长则随机起点），公开发言卡 update_card 同步进度，当前发言人私密收到输入卡。**全员说完才能投票**，避免抢话
-
-**AI 玩家**：配 `OPENAI_API_KEY` 后可加入 LLM 驱动的 AI。每个角色都有专属 prompt：狼/狼王夜杀 + 队伍频道发言 / 预查验 / 女巫救毒 / 守卫守护 / 猎人 / 狼王开枪 / 上警决策 / 警长投票 / 警徽流转 / 白天发言。AI 失败/超时自动 fallback 到安全选择。
-
-## AI 对手
-
-设置了 `OPENAI_API_KEY` 后，大厅多一个 `[加入 AI]` 按钮，点一次加一个 LLM 驱动的 AI 玩家（可加多个）。AI 轮到时机器人会带着公共牌、手牌、底池、equity、历史动作请 LLM 给出 fold/check/call/raise/allin 决策，模型用 `response_format=json_object` 返回结构化 JSON。LLM 失败/超时自动 fallback 到 check 或 fold。
-
-兼容任何 OpenAI 风格端点（DeepSeek / 豆包 / OpenAI / OpenRouter / vLLM 等）。`.env.example` 里有几个端点的配置示例。
-
-## 注意事项
-
-- 卡片 JSON 2.0 要求 Lark 客户端 v7.20+
-- 游戏状态持久化到 redb（`LARK_ARENA_DB_PATH`，默认 `arena.redb`），筹码 / 玩家 / AI 座位重启不丢
-- 进行中的一手牌如果在容器重启之间被打断，下次 `[开局]` 会按"卡住"处理：退还场上筹码 + 重新发牌
-- 牌局卡住用 `/poker reset` 手动重置
-- 双层去重抗飞书重投：`event_id`（120s 窗口） + `(open_id, value)` 指纹（3s 窗口）
-
-## 项目结构
-
+```dotenv
+OPENAI_API_KEY=sk-xxx
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_REASONING_EFFORT=xhigh
 ```
-src/
-├── main.rs              入口；--mock <open_id> 把所有卡片样式发到群里看
-├── config.rs            env 加载
-├── feishu/
-│   ├── client.rs        token 缓存 + 发消息 / 临时消息 / 更新卡片
-│   ├── cards.rs         JSON 2.0 helpers
-│   └── events.rs        webhook payload 解析
-├── poker/               德州扑克
-│   ├── card.rs          Card / Suit / Rank / Deck
-│   ├── hand.rs          7 张牌评估器
-│   └── equity.rs        Monte Carlo 胜率
-├── werewolf/            狼人杀
-│   ├── game.rs          角色 / 阶段 / 状态机
-│   ├── cards.rs         身份卡 / 夜间卡 / 投票卡 / 结算卡
-│   ├── llm.rs           各角色的 AI 决策 prompt
-│   └── handlers.rs      bot.rs 的 Bot 扩展（命令/回调/AI 推进）
-├── game.rs              德州状态机
-├── llm.rs               OpenAI 客户端封装（共享）
-├── bot.rs               事件分发 + 卡片渲染 + dedup
-├── storage.rs           redb 持久化（games + wolf_games 两张表）
-└── server.rs            axum HTTP server
+
+`OPENAI_REASONING_EFFORT` 控制模型思考强度，可选值为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`，默认 `xhigh`。具体档位是否生效取决于所使用的模型和 OpenAI-compatible 服务商。
+
+可选配置：
+
+```dotenv
+FEISHU_VERIFICATION_TOKEN=
+ALLOWED_CHAT_ID=
+BIND_ADDR=0.0.0.0:3000
+LARK_ARENA_DB_PATH=./lark-arena.redb
 ```
+
+## 飞书事件
+
+在飞书开放平台配置以下订阅和回调：
+
+| 类型 | 路径 / 事件 |
+| --- | --- |
+| Event 回调 | `/webhook/event` |
+| Card 回调 | `/webhook/card` |
+| 消息 | `im.message.receive_v1` |
+| 用户进群 | `im.chat.member.user.added_v1` |
+| 机器人进群 | `im.chat.member.bot.added_v1` |
+
+## 命令
+
+可使用 `/wolf <命令>`，或在群里 `@机器人 <命令>`：
+
+| 命令 | 作用 |
+| --- | --- |
+| `join` / `加入` | 加入狼人杀房间 |
+| `leave` / `离开` | 离开房间 |
+| `start` / `开始` | 9-12 人时开局 |
+| `reset` / `重置` | 重置房间 |
+| `help` / `帮助` | 查看帮助 |
+
+大厅卡片提供同等操作；人数不足时点击 **AI 补齐人数** 会一次补足到 9 人。
 
 ## 开发
 
 ```bash
-git clone https://github.com/gtoxlili/lark-arena
-cd lark-arena
-cp .env.example .env
+cargo check --locked
+cargo test --locked
 cargo run --release
-cargo test
 ```
 
-把所有卡片样式发到 `ALLOWED_CHAT_ID` 看效果：
+容器构建：
 
 ```bash
-./target/release/lark-arena --mock <你的 open_id>
+docker build -t lark-arena .
 ```
 
-## CI 和镜像
+项目要求 Rust 1.89+，使用 Rust 2024 edition。
 
-每次推 `main` 或打 `v*` tag，[.github/workflows/ci.yml](.github/workflows/ci.yml) 会跑 `docker buildx build`。Dockerfile 里有 `test` 阶段，cargo test 通过后才 build runtime 阶段，最后推到 `ghcr.io/gtoxlili/lark-arena:{latest, main, sha-<short>, v<semver>}`。
+## 目录
 
-Dockerfile 用 cargo-chef 缓存依赖，distroless/cc-debian12:nonroot 作运行时，最终镜像约 30 MB。
+```text
+src/
+├── bot.rs              狼人杀大厅、命令与卡片入口
+├── config.rs           环境配置
+├── feishu/             飞书事件、API 客户端与卡片组件
+├── llm.rs              OpenAI-compatible JSON 对话客户端
+├── persona.rs          AI 策略风格
+├── server.rs           Axum webhook 服务
+├── storage.rs          redb 狼人杀存档
+└── werewolf/           状态机、卡片、AI 决策与推进循环
+```
 
 ## License
 
-MIT
+GPL-3.0

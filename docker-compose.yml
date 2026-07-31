@@ -1,0 +1,24 @@
+services:
+  lark-arena:
+    image: ghcr.io/kkkk24juastin/lark-arena:latest
+    container_name: lark-arena
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - FEISHU_APP_ID=${FEISHU_APP_ID}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - FEISHU_VERIFICATION_TOKEN=${FEISHU_VERIFICATION_TOKEN:-}
+      - ALLOWED_CHAT_ID=${ALLOWED_CHAT_ID:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com}
+      - OPENAI_MODEL=${OPENAI_MODEL:-deepseek-v4-flash}
+      - OPENAI_REASONING_EFFORT=${OPENAI_REASONING_EFFORT:-xhigh}
+      - BIND_ADDR=0.0.0.0:8080
+      - LARK_ARENA_DB_PATH=/data/arena.redb
+      - RUST_LOG=lark_arena=info,tower_http=info
+    volumes:
+      - lark-arena-data:/data
+
+volumes:
+  lark-arena-data:
