@@ -9,14 +9,30 @@ use crate::werewolf::{WolfGame, game::Stage};
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+pub(crate) struct WolfAdvanceGate {
+    pub(crate) lock: tokio::sync::Mutex<()>,
+    pub(crate) pending: AtomicBool,
+}
+
+impl Default for WolfAdvanceGate {
+    fn default() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            pending: AtomicBool::new(false),
+        }
+    }
+}
 
 pub struct Bot {
     pub client: Arc<crate::feishu::Client>,
     pub(crate) cfg: Config,
     pub(crate) wolf_games: Mutex<FoldHashMap<String, WolfGame>>,
+    pub(crate) wolf_advance_gates: Mutex<FoldHashMap<String, Arc<WolfAdvanceGate>>>,
     pub(crate) bot_open_id: Mutex<Option<String>>,
     pub(crate) seen_events: Mutex<FoldHashMap<String, Instant>>,
     pub(crate) seen_actions: Mutex<FoldHashMap<u64, Instant>>,
@@ -56,6 +72,7 @@ impl Bot {
             client,
             cfg,
             wolf_games: Mutex::new(wolf_games),
+            wolf_advance_gates: Mutex::new(FoldHashMap::default()),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(FoldHashMap::default()),
             seen_actions: Mutex::new(FoldHashMap::default()),

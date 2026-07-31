@@ -3,8 +3,8 @@
 //! `impl Bot` 扩展，复用 bot.rs 的 client / store / llm / dedup。每个 chat
 //! 同时最多一桌狼人杀，由 `bot.wolf_games` map 管理。
 //!
-//! 推进核心：`advance_wolf` 串行驱动 AI 完成所有当前阶段能立即推进的工作，
-//! 直到必须等待人类点击为止。
+//! 推进核心：每个房间由一个 `advance_wolf` 驱动；规则上同时发生的 AI 决策
+//! 并发请求，其余阶段按状态机顺序推进，直到必须等待人类点击为止。
 
 use crate::bot::{toast, Bot};
 use crate::feishu::cards::{card, header, markdown};
@@ -17,8 +17,41 @@ use crate::werewolf::llm as wolf_llm;
 use crate::werewolf::llm::AttemptHistory;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::future::{poll_fn, Future};
+use std::sync::atomic::Ordering;
+use std::task::Poll;
 use tracing::{info, warn};
+
+/// Poll a dynamic set of futures concurrently while preserving input order.
+/// The game has at most twelve seats, so a compact in-task join avoids adding
+/// another dependency or requiring spawned futures to be `'static`.
+async fn join_all_ordered<F>(futures: Vec<F>) -> Vec<F::Output>
+where
+    F: Future,
+{
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> =
+        std::iter::repeat_with(|| None).take(futures.len()).collect();
+
+    poll_fn(|cx| {
+        let mut all_ready = true;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_some() {
+                continue;
+            }
+            match future.as_mut().poll(cx) {
+                Poll::Ready(value) => *output = Some(value),
+                Poll::Pending => all_ready = false,
+            }
+        }
+        if all_ready {
+            Poll::Ready(outputs.iter_mut().map(|output| output.take().unwrap()).collect())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
 
 /// 两种顺序发言的语义区分。
 enum SpeechKind {
@@ -715,9 +748,42 @@ impl Bot {
     // 推进循环（核心）
     // ========================================================================
 
-    /// 串行驱动游戏前进——每个阶段处理 AI 自动行动 / 公告 / 状态切换，直到必须等待人类点击为止。
-    /// 可重入：每次外部事件后都安全地再调用一次。
+    /// 每个房间只允许一个推进器运行。不同房间互不阻塞；同一房间后到的
+    /// 推进请求只设置 pending 标记，由当前推进器合并处理，不会阻塞回调。
     pub(crate) async fn advance_wolf(&self, chat_id: &str) {
+        let gate = {
+            let mut gates = self.wolf_advance_gates.lock();
+            gates
+                .entry(chat_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(crate::bot::WolfAdvanceGate::default()))
+                .clone()
+        };
+        gate.pending.store(true, Ordering::Release);
+
+        let Ok(mut guard) = gate.lock.try_lock() else {
+            return;
+        };
+        loop {
+            gate.pending.store(false, Ordering::Release);
+            self.advance_wolf_inner(chat_id).await;
+            if gate.pending.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+
+            // Drop before the final check: a trigger racing with shutdown can
+            // either acquire the gate itself or leave pending for this task.
+            drop(guard);
+            if !gate.pending.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            guard = match gate.lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+        }
+    }
+
+    async fn advance_wolf_inner(&self, chat_id: &str) {
         // 防递归：上限若干次循环避免任何意外。
         for _ in 0..50 {
             let stage_now = {
@@ -836,7 +902,6 @@ impl Bot {
                         }
                         self.persist_wolf_locked(chat_id, g);
                     }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
                 }
 
                 Stage::SheriffNominate => {
@@ -853,8 +918,14 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    for (idx, oid) in pending_ais {
-                        let run = self.sheriff_run_ai(chat_id, idx).await;
+                    let decisions = join_all_ordered(
+                        pending_ais
+                            .iter()
+                            .map(|(idx, _)| self.sheriff_run_ai(chat_id, *idx))
+                            .collect(),
+                    )
+                    .await;
+                    for ((_, oid), run) in pending_ais.into_iter().zip(decisions) {
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
@@ -862,7 +933,6 @@ impl Bot {
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
 
                     let all_done = {
@@ -936,12 +1006,24 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    for (idx, oid) in pending_ais {
+                    let empty_history: AttemptHistory = vec![];
+                    let initial_decisions = join_all_ordered(
+                        pending_ais
+                            .iter()
+                            .map(|(idx, _)| {
+                                self.sheriff_vote_ai(chat_id, *idx, &empty_history)
+                            })
+                            .collect(),
+                    )
+                    .await;
+                    for ((idx, oid), initial_target) in
+                        pending_ais.into_iter().zip(initial_decisions)
+                    {
                         // retry-with-feedback：AI 投错就把错误反馈让它重选
                         let mut hist: AttemptHistory = vec![];
                         let mut decided = false;
-                        for _ in 0..3 {
-                            let target_opt = self.sheriff_vote_ai(chat_id, idx, &hist).await;
+                        let mut target_opt = initial_target;
+                        for attempt in 0..3 {
                             let target_oid = target_opt.and_then(|t| {
                                 let games = self.wolf_games.lock();
                                 games.get(chat_id).and_then(|g| {
@@ -958,14 +1040,23 @@ impl Bot {
                                 r
                             };
                             match result {
-                                Ok(()) => { decided = true; break; }
-                                Err(e) => hist.push((
-                                    format!(
-                                        "{{\"target_idx\": {}}}",
-                                        target_opt.map(|i| i as i64).unwrap_or(-1)
-                                    ),
-                                    e.to_string(),
-                                )),
+                                Ok(()) => {
+                                    decided = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    hist.push((
+                                        format!(
+                                            "{{\"target_idx\": {}}}",
+                                            target_opt.map(|i| i as i64).unwrap_or(-1)
+                                        ),
+                                        e.to_string(),
+                                    ));
+                                    if attempt < 2 {
+                                        target_opt =
+                                            self.sheriff_vote_ai(chat_id, idx, &hist).await;
+                                    }
+                                }
                             }
                         }
                         if !decided {
@@ -976,7 +1067,6 @@ impl Bot {
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
                     }
 
                     let all_done = {
@@ -1111,7 +1201,6 @@ impl Bot {
                             .send_message("chat_id", chat_id, "interactive", &announce)
                             .await;
                     }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
                 }
 
                 Stage::WolvesPick => {
@@ -1169,7 +1258,6 @@ impl Bot {
                                 }
                             }
                             // 3 次都失败就跳过这只狼（这只狼无效投票）
-                            tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                         // 直接 advance（无需"我决定了"）
                         let mut games = self.wolf_games.lock();
@@ -1299,7 +1387,6 @@ impl Bot {
                             }
                         }
                         self.broadcast_wolf_night_update(chat_id).await;
-                        tokio::time::sleep(Duration::from_millis(700)).await;
                     }
 
                     // 检查是否所有存活狼都就绪
@@ -1414,7 +1501,6 @@ impl Bot {
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
                 }
 
                 Stage::WitchAct => {
@@ -1497,7 +1583,6 @@ impl Bot {
                             self.persist_wolf_locked(chat_id, g);
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
                 }
 
                 Stage::DayReveal => {
@@ -1561,7 +1646,6 @@ impl Bot {
                                 .send_message("chat_id", chat_id, "interactive", &announce)
                                 .await;
                         }
-                        tokio::time::sleep(Duration::from_millis(400)).await;
                     } else {
                         // 人类警长 → 私发选择卡
                         let game = {
@@ -1652,7 +1736,6 @@ impl Bot {
                                 }
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(700)).await;
                     } else {
                         self.send_or_update_last_words_private(chat_id, spk_idx, &spk_oid)
                             .await;
@@ -1699,7 +1782,6 @@ impl Bot {
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(700)).await;
                     } else {
                         self.send_or_update_speech_private(
                             chat_id,
@@ -1770,7 +1852,6 @@ impl Bot {
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(700)).await;
                     } else {
                         self.send_or_update_speech_private(
                             chat_id,
@@ -1796,12 +1877,22 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    for (idx, oid) in pending_ais {
+                    let empty_history: AttemptHistory = vec![];
+                    let initial_decisions = join_all_ordered(
+                        pending_ais
+                            .iter()
+                            .map(|(idx, _)| self.vote_ai_pick(chat_id, *idx, &empty_history))
+                            .collect(),
+                    )
+                    .await;
+                    for ((idx, oid), initial_decision) in
+                        pending_ais.into_iter().zip(initial_decisions)
+                    {
                         // 投票 retry-with-feedback；不再带 quip
                         let mut hist: AttemptHistory = vec![];
                         let mut decided = false;
-                        for _ in 0..3 {
-                            let decision = self.vote_ai_pick(chat_id, idx, &hist).await;
+                        let mut decision = initial_decision;
+                        for attempt in 0..3 {
                             let target_oid = {
                                 let games = self.wolf_games.lock();
                                 let Some(g) = games.get(chat_id) else { return };
@@ -1820,14 +1911,22 @@ impl Bot {
                                 r
                             };
                             match r {
-                                Ok(()) => { decided = true; break; }
-                                Err(e) => hist.push((
-                                    format!(
-                                        "{{\"target_idx\": {}}}",
-                                        decision.target_idx.map(|i| i as i64).unwrap_or(-1)
-                                    ),
-                                    e.to_string(),
-                                )),
+                                Ok(()) => {
+                                    decided = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    hist.push((
+                                        format!(
+                                            "{{\"target_idx\": {}}}",
+                                            decision.target_idx.map(|i| i as i64).unwrap_or(-1)
+                                        ),
+                                        e.to_string(),
+                                    ));
+                                    if attempt < 2 {
+                                        decision = self.vote_ai_pick(chat_id, idx, &hist).await;
+                                    }
+                                }
                             }
                         }
                         if !decided {
@@ -1838,7 +1937,6 @@ impl Bot {
                                 self.persist_wolf_locked(chat_id, g);
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(300)).await;
                     }
 
                     // 2. 是否所有人都投了？
@@ -2048,7 +2146,6 @@ impl Bot {
                             .send_message("chat_id", chat_id, "interactive", &announce)
                             .await;
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
 
@@ -2719,5 +2816,33 @@ impl Bot {
             }
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::join_all_ordered;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dynamic_join_starts_all_futures_and_preserves_order() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let futures = (0..3)
+            .map(|idx| {
+                let barrier = barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    idx
+                }
+            })
+            .collect();
+
+        let outputs =
+            tokio::time::timeout(Duration::from_secs(1), join_all_ordered(futures))
+                .await
+                .expect("futures should be polled concurrently");
+
+        assert_eq!(outputs, vec![0, 1, 2]);
     }
 }
