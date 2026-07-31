@@ -285,6 +285,9 @@ pub struct WolfGame {
     /// (open_id, msg_id)。每轮 day vote 开始时清空。
     #[serde(default)]
     pub day_vote_msgs: Vec<(String, String)>,
+    /// 白天投票公开进度卡 message_id。
+    #[serde(default)]
+    pub day_vote_public_msg: Option<String>,
     pub seer_check_target: Option<usize>,
     pub witch_save_choice: Option<bool>,
     pub witch_poison_target: Option<usize>,
@@ -336,6 +339,12 @@ pub struct WolfGame {
     /// 上警投票（候选人不能投票）。
     #[serde(default)]
     pub sheriff_votes: Ballot,
+    /// 警长投票每位真人收到的私密投票卡 message_id。
+    #[serde(default)]
+    pub sheriff_vote_msgs: Vec<(String, String)>,
+    /// 警长投票公开进度卡 message_id。
+    #[serde(default)]
+    pub sheriff_vote_public_msg: Option<String>,
     /// 警长候选人发言顺序（按提名顺序）。
     #[serde(default)]
     pub sheriff_speech_order: Vec<usize>,
@@ -505,6 +514,7 @@ impl WolfGame {
             wolf_ready: vec![],
             wolf_night_msgs: vec![],
             day_vote_msgs: vec![],
+            day_vote_public_msg: None,
             seer_check_target: None,
             witch_save_choice: None,
             witch_poison_target: None,
@@ -527,6 +537,8 @@ impl WolfGame {
             sheriff_enabled: false,
             sheriff_nominations: vec![],
             sheriff_votes: Ballot::default(),
+            sheriff_vote_msgs: vec![],
+            sheriff_vote_public_msg: None,
             sheriff_speech_order: vec![],
             sheriff_speech_idx: 0,
             sheriff_speeches: vec![],
@@ -704,6 +716,8 @@ impl WolfGame {
         self.seer_history.clear();
         self.last_guard_target = None;
         self.day_votes.clear();
+        self.day_vote_msgs.clear();
+        self.day_vote_public_msg = None;
         self.last_night_deaths.clear();
         self.last_day_lynched = None;
         self.day_speech_order.clear();
@@ -715,6 +729,8 @@ impl WolfGame {
         self.sheriff_enabled = has_sheriff_election(n);
         self.sheriff_nominations.clear();
         self.sheriff_votes.clear();
+        self.sheriff_vote_msgs.clear();
+        self.sheriff_vote_public_msg = None;
         self.sheriff_speech_order.clear();
         self.sheriff_speech_idx = 0;
         self.sheriff_speeches.clear();
@@ -1416,6 +1432,8 @@ impl WolfGame {
         }
         self.stage = Stage::SheriffVote;
         self.sheriff_votes.clear();
+        self.sheriff_vote_msgs.clear();
+        self.sheriff_vote_public_msg = None;
         Ok(())
     }
 
@@ -1536,6 +1554,25 @@ impl WolfGame {
             .iter()
             .filter(|i| !candidates.contains(i))
             .all(|i| self.sheriff_votes.for_voter(*i).is_some())
+    }
+
+    pub fn set_sheriff_vote_msg(&mut self, open_id: &str, msg_id: String) {
+        if let Some(slot) = self
+            .sheriff_vote_msgs
+            .iter_mut()
+            .find(|(oid, _)| oid == open_id)
+        {
+            slot.1 = msg_id;
+        } else {
+            self.sheriff_vote_msgs.push((open_id.to_string(), msg_id));
+        }
+    }
+
+    pub fn sheriff_vote_msg(&self, open_id: &str) -> Option<&str> {
+        self.sheriff_vote_msgs
+            .iter()
+            .find(|(oid, _)| oid == open_id)
+            .map(|(_, id)| id.as_str())
     }
 
     /// 解析警长投票，确定警长人选（平票 = 无警长）。
@@ -1661,6 +1698,7 @@ impl WolfGame {
         self.stage = Stage::DayVote;
         self.day_votes.clear();
         self.day_vote_msgs.clear();
+        self.day_vote_public_msg = None;
         Ok(())
     }
 
@@ -1919,6 +1957,7 @@ impl WolfGame {
         self.wolf_ready.clear();
         self.wolf_night_msgs.clear();
         self.day_vote_msgs.clear();
+        self.day_vote_public_msg = None;
         self.seer_check_target = None;
         self.witch_save_choice = None;
         self.witch_poison_target = None;

@@ -637,6 +637,43 @@ pub fn build_sheriff_vote_card(game: &WolfGame, viewer: &Player) -> Value {
     )
 }
 
+/// 警长投票的公开进度。只展示是否完成，不泄露投票目标或是否弃权。
+pub fn build_sheriff_vote_progress_card(game: &WolfGame) -> Value {
+    let candidates = game.sheriff_candidates();
+    let voters: Vec<usize> = game
+        .alive_indices()
+        .into_iter()
+        .filter(|i| !candidates.contains(i))
+        .collect();
+    let voted = voters
+        .iter()
+        .filter(|i| game.sheriff_votes.for_voter(**i).is_some())
+        .count();
+    let lines: Vec<String> = game
+        .alive_indices()
+        .into_iter()
+        .map(|i| {
+            let status = if candidates.contains(&i) {
+                "🎖️ 候选人，无需投票"
+            } else if game.sheriff_votes.for_voter(i).is_some() {
+                "✅ 已投"
+            } else {
+                "⏳ 未投"
+            };
+            format!("• {} · {}", display_name(&game.players[i]), status)
+        })
+        .collect();
+
+    card(
+        header_with_subtitle(
+            "🎖️ 警长投票进度",
+            &format!("{voted}/{} 已完成", voters.len()),
+            "yellow",
+        ),
+        vec![markdown(&lines.join("\n")), note("仅显示投票状态，不公开票型")],
+    )
+}
+
 // ============================================================================
 // 顺序发言（上警发言 / 白天轮流发言）
 // ============================================================================
@@ -900,6 +937,39 @@ pub fn build_vote_card(game: &WolfGame, viewer: &Player) -> Value {
             "blue",
         ),
         elements,
+    )
+}
+
+/// 白天放逐投票的公开进度。只展示是否完成，不泄露投票目标或是否弃权。
+pub fn build_day_vote_progress_card(game: &WolfGame) -> Value {
+    let alive = game.alive_indices();
+    let voted = alive
+        .iter()
+        .filter(|i| game.day_votes.for_voter(**i).is_some())
+        .count();
+    let lines: Vec<String> = game
+        .players
+        .iter()
+        .enumerate()
+        .map(|(i, player)| {
+            let status = if !player.alive {
+                "☠️ 已出局，无需投票"
+            } else if game.day_votes.for_voter(i).is_some() {
+                "✅ 已投"
+            } else {
+                "⏳ 未投"
+            };
+            format!("• {} · {}", display_name(player), status)
+        })
+        .collect();
+
+    card(
+        header_with_subtitle(
+            "🗳️ 投票进度",
+            &format!("第 {} 天 · {voted}/{} 已完成", game.day, alive.len()),
+            "blue",
+        ),
+        vec![markdown(&lines.join("\n")), note("仅显示投票状态，不公开票型")],
     )
 }
 
@@ -1284,4 +1354,49 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
         out.push(buf);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn voting_game() -> WolfGame {
+        let mut game = WolfGame::new("chat".into());
+        game.add_player("p1".into(), "玩家一".into()).unwrap();
+        game.add_player("p2".into(), "玩家二".into()).unwrap();
+        game.add_player("p3".into(), "玩家三".into()).unwrap();
+        game
+    }
+
+    #[test]
+    fn day_vote_progress_shows_status_without_ballot_details() {
+        let mut game = voting_game();
+        game.stage = Stage::DayVote;
+        game.cast_vote("p1", Some("p2")).unwrap();
+
+        let encoded = build_day_vote_progress_card(&game).to_string();
+        assert!(encoded.contains("1/3 已完成"));
+        assert!(encoded.contains("✅ 已投"));
+        assert!(encoded.contains("⏳ 未投"));
+        assert!(!encoded.contains('→'));
+        assert!(!encoded.contains("弃权"));
+        assert!(!encoded.contains("wolf_vote"));
+    }
+
+    #[test]
+    fn sheriff_vote_progress_marks_candidates_as_not_voting() {
+        let mut game = voting_game();
+        game.stage = Stage::SheriffVote;
+        game.sheriff_nominations = vec![(0, true), (1, false), (2, false)];
+        game.cast_sheriff_vote("p2", Some("p1")).unwrap();
+
+        let encoded = build_sheriff_vote_progress_card(&game).to_string();
+        assert!(encoded.contains("1/2 已完成"));
+        assert!(encoded.contains("候选人，无需投票"));
+        assert!(encoded.contains("✅ 已投"));
+        assert!(encoded.contains("⏳ 未投"));
+        assert!(!encoded.contains('→'));
+        assert!(!encoded.contains("弃权"));
+        assert!(!encoded.contains("wolf_sheriff_vote"));
+    }
 }

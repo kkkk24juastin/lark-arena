@@ -33,6 +33,8 @@ pub struct Bot {
     pub(crate) cfg: Config,
     pub(crate) wolf_games: Mutex<FoldHashMap<String, WolfGame>>,
     pub(crate) wolf_advance_gates: Mutex<FoldHashMap<String, Arc<WolfAdvanceGate>>>,
+    pub(crate) wolf_vote_refresh_locks:
+        Mutex<FoldHashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) bot_open_id: Mutex<Option<String>>,
     pub(crate) seen_events: Mutex<FoldHashMap<String, Instant>>,
     pub(crate) seen_actions: Mutex<FoldHashMap<u64, Instant>>,
@@ -73,6 +75,7 @@ impl Bot {
             cfg,
             wolf_games: Mutex::new(wolf_games),
             wolf_advance_gates: Mutex::new(FoldHashMap::default()),
+            wolf_vote_refresh_locks: Mutex::new(FoldHashMap::default()),
             bot_open_id: Mutex::new(None),
             seen_events: Mutex::new(FoldHashMap::default()),
             seen_actions: Mutex::new(FoldHashMap::default()),

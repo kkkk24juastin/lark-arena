@@ -59,6 +59,12 @@ enum SpeechKind {
     Day,
 }
 
+#[derive(Clone, Copy)]
+enum VoteProgressKind {
+    Sheriff,
+    Day,
+}
+
 impl Bot {
     // ========================================================================
     // 持久化
@@ -400,6 +406,8 @@ impl Bot {
                 let bot = self.clone();
                 let cid = chat_id.clone();
                 tokio::spawn(async move {
+                    bot.refresh_vote_progress_public(&cid, VoteProgressKind::Day)
+                        .await;
                     bot.advance_wolf(&cid).await;
                 });
                 Ok(toast("已投票"))
@@ -422,6 +430,8 @@ impl Bot {
                 let bot = self.clone();
                 let cid = chat_id.clone();
                 tokio::spawn(async move {
+                    bot.refresh_vote_progress_public(&cid, VoteProgressKind::Day)
+                        .await;
                     bot.advance_wolf(&cid).await;
                 });
                 Ok(toast("已弃权"))
@@ -643,6 +653,8 @@ impl Bot {
         let bot = self.clone();
         let cid = chat_id.to_string();
         tokio::spawn(async move {
+            bot.refresh_vote_progress_public(&cid, VoteProgressKind::Sheriff)
+                .await;
             bot.advance_wolf(&cid).await;
         });
         Ok(toast("已投票"))
@@ -1006,68 +1018,81 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    let empty_history: AttemptHistory = vec![];
-                    let initial_decisions = join_all_ordered(
-                        pending_ais
-                            .iter()
-                            .map(|(idx, _)| {
-                                self.sheriff_vote_ai(chat_id, *idx, &empty_history)
-                            })
-                            .collect(),
-                    )
-                    .await;
-                    for ((idx, oid), initial_target) in
-                        pending_ais.into_iter().zip(initial_decisions)
-                    {
-                        // retry-with-feedback：AI 投错就把错误反馈让它重选
-                        let mut hist: AttemptHistory = vec![];
-                        let mut decided = false;
-                        let mut target_opt = initial_target;
-                        for attempt in 0..3 {
-                            let target_oid = target_opt.and_then(|t| {
-                                let games = self.wolf_games.lock();
-                                games.get(chat_id).and_then(|g| {
-                                    g.players.get(t).map(|p| p.open_id.clone())
-                                })
-                            });
-                            let result = {
-                                let mut games = self.wolf_games.lock();
-                                let Some(g) = games.get_mut(chat_id) else { return };
-                                let r = g.cast_sheriff_vote(&oid, target_oid.as_deref());
-                                if r.is_ok() {
-                                    self.persist_wolf_locked(chat_id, g);
-                                }
-                                r
-                            };
-                            match result {
-                                Ok(()) => {
-                                    decided = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    hist.push((
-                                        format!(
-                                            "{{\"target_idx\": {}}}",
-                                            target_opt.map(|i| i as i64).unwrap_or(-1)
-                                        ),
-                                        e.to_string(),
-                                    ));
-                                    if attempt < 2 {
-                                        target_opt =
-                                            self.sheriff_vote_ai(chat_id, idx, &hist).await;
+                    let ai_votes = async {
+                        let tasks = pending_ais
+                            .into_iter()
+                            .map(|(idx, oid)| async move {
+                                // 每个 AI 独立完成“请求、校验、落票、刷新”，彼此并发。
+                                let mut hist: AttemptHistory = vec![];
+                                let mut decided = false;
+                                let mut target_opt =
+                                    self.sheriff_vote_ai(chat_id, idx, &hist).await;
+                                for attempt in 0..3 {
+                                    let target_oid = target_opt.and_then(|t| {
+                                        let games = self.wolf_games.lock();
+                                        games.get(chat_id).and_then(|g| {
+                                            g.players.get(t).map(|p| p.open_id.clone())
+                                        })
+                                    });
+                                    let result = {
+                                        let mut games = self.wolf_games.lock();
+                                        let Some(g) = games.get_mut(chat_id) else { return };
+                                        let r =
+                                            g.cast_sheriff_vote(&oid, target_oid.as_deref());
+                                        if r.is_ok() {
+                                            self.persist_wolf_locked(chat_id, g);
+                                        }
+                                        r
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            decided = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            hist.push((
+                                                format!(
+                                                    "{{\"target_idx\": {}}}",
+                                                    target_opt
+                                                        .map(|i| i as i64)
+                                                        .unwrap_or(-1)
+                                                ),
+                                                e.to_string(),
+                                            ));
+                                            if attempt < 2 {
+                                                target_opt = self
+                                                    .sheriff_vote_ai(chat_id, idx, &hist)
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        if !decided {
-                            // 兜底：弃权
-                            let mut games = self.wolf_games.lock();
-                            if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.cast_sheriff_vote(&oid, None);
-                                self.persist_wolf_locked(chat_id, g);
-                            }
-                        }
-                    }
+                                if !decided {
+                                    let mut games = self.wolf_games.lock();
+                                    if let Some(g) = games.get_mut(chat_id) {
+                                        let _ = g.cast_sheriff_vote(&oid, None);
+                                        self.persist_wolf_locked(chat_id, g);
+                                    }
+                                }
+                                self.refresh_vote_progress_public(
+                                    chat_id,
+                                    VoteProgressKind::Sheriff,
+                                )
+                                .await;
+                            })
+                            .collect();
+                        join_all_ordered(tasks).await;
+                    };
+                    let prepare_humans = async {
+                        tokio::join!(
+                            self.refresh_vote_progress_public(
+                                chat_id,
+                                VoteProgressKind::Sheriff
+                            ),
+                            self.ensure_sheriff_vote_cards(chat_id),
+                        );
+                    };
+                    tokio::join!(prepare_humans, ai_votes);
 
                     let all_done = {
                         let games = self.wolf_games.lock();
@@ -1077,36 +1102,6 @@ impl Bot {
                             .unwrap_or(false)
                     };
                     if !all_done {
-                        // 给非候选人类发投票卡
-                        let humans_pending: Vec<String> = {
-                            let games = self.wolf_games.lock();
-                            let Some(g) = games.get(chat_id) else { return };
-                            let candidates = g.sheriff_candidates();
-                            g.alive_indices()
-                                .into_iter()
-                                .filter(|i| {
-                                    !g.players[*i].is_ai
-                                        && !candidates.contains(i)
-                                        && g.sheriff_votes.for_voter(*i).is_none()
-                                })
-                                .map(|i| g.players[i].open_id.clone())
-                                .collect()
-                        };
-                        for oid in humans_pending {
-                            let game = {
-                                let games = self.wolf_games.lock();
-                                games.get(chat_id).cloned()
-                            };
-                            if let Some(g) = game {
-                                if let Some(p_idx) = g.find_player(&oid) {
-                                    let c = build_sheriff_vote_card(&g, &g.players[p_idx]);
-                                    let _ = self
-                                        .client
-                                        .send_ephemeral_card(chat_id, &oid, &c)
-                                        .await;
-                                }
-                            }
-                        }
                         return;
                     }
 
@@ -1865,7 +1860,7 @@ impl Bot {
                 }
 
                 Stage::DayVote => {
-                    // 1. AI 投票
+                    // 真人收卡、公开进度和 AI 投票同步开始。
                     let pending_ais: Vec<(usize, String)> = {
                         let games = self.wolf_games.lock();
                         let Some(g) = games.get(chat_id) else { return };
@@ -1877,123 +1872,89 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    let empty_history: AttemptHistory = vec![];
-                    let initial_decisions = join_all_ordered(
-                        pending_ais
-                            .iter()
-                            .map(|(idx, _)| self.vote_ai_pick(chat_id, *idx, &empty_history))
-                            .collect(),
-                    )
-                    .await;
-                    for ((idx, oid), initial_decision) in
-                        pending_ais.into_iter().zip(initial_decisions)
-                    {
-                        // 投票 retry-with-feedback；不再带 quip
-                        let mut hist: AttemptHistory = vec![];
-                        let mut decided = false;
-                        let mut decision = initial_decision;
-                        for attempt in 0..3 {
-                            let target_oid = {
-                                let games = self.wolf_games.lock();
-                                let Some(g) = games.get(chat_id) else { return };
-                                decision
-                                    .target_idx
-                                    .and_then(|t| g.players.get(t))
-                                    .map(|p| p.open_id.clone())
-                            };
-                            let r = {
-                                let mut games = self.wolf_games.lock();
-                                let Some(g) = games.get_mut(chat_id) else { return };
-                                let r = g.cast_vote(&oid, target_oid.as_deref());
-                                if r.is_ok() {
-                                    self.persist_wolf_locked(chat_id, g);
-                                }
-                                r
-                            };
-                            match r {
-                                Ok(()) => {
-                                    decided = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    hist.push((
-                                        format!(
-                                            "{{\"target_idx\": {}}}",
-                                            decision.target_idx.map(|i| i as i64).unwrap_or(-1)
-                                        ),
-                                        e.to_string(),
-                                    ));
-                                    if attempt < 2 {
-                                        decision = self.vote_ai_pick(chat_id, idx, &hist).await;
+                    let ai_votes = async {
+                        let tasks = pending_ais
+                            .into_iter()
+                            .map(|(idx, oid)| async move {
+                                // 投票 retry-with-feedback；不再带 quip。
+                                let mut hist: AttemptHistory = vec![];
+                                let mut decided = false;
+                                let mut decision = self.vote_ai_pick(chat_id, idx, &hist).await;
+                                for attempt in 0..3 {
+                                    let target_oid = {
+                                        let games = self.wolf_games.lock();
+                                        let Some(g) = games.get(chat_id) else { return };
+                                        decision
+                                            .target_idx
+                                            .and_then(|t| g.players.get(t))
+                                            .map(|p| p.open_id.clone())
+                                    };
+                                    let result = {
+                                        let mut games = self.wolf_games.lock();
+                                        let Some(g) = games.get_mut(chat_id) else { return };
+                                        let r = g.cast_vote(&oid, target_oid.as_deref());
+                                        if r.is_ok() {
+                                            self.persist_wolf_locked(chat_id, g);
+                                        }
+                                        r
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            decided = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            hist.push((
+                                                format!(
+                                                    "{{\"target_idx\": {}}}",
+                                                    decision
+                                                        .target_idx
+                                                        .map(|i| i as i64)
+                                                        .unwrap_or(-1)
+                                                ),
+                                                e.to_string(),
+                                            ));
+                                            if attempt < 2 {
+                                                decision =
+                                                    self.vote_ai_pick(chat_id, idx, &hist).await;
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        if !decided {
-                            // 兜底：弃权
-                            let mut games = self.wolf_games.lock();
-                            if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.cast_vote(&oid, None);
-                                self.persist_wolf_locked(chat_id, g);
-                            }
-                        }
-                    }
+                                if !decided {
+                                    let mut games = self.wolf_games.lock();
+                                    if let Some(g) = games.get_mut(chat_id) {
+                                        let _ = g.cast_vote(&oid, None);
+                                        self.persist_wolf_locked(chat_id, g);
+                                    }
+                                }
+                                self.refresh_vote_progress_public(
+                                    chat_id,
+                                    VoteProgressKind::Day,
+                                )
+                                .await;
+                            })
+                            .collect();
+                        join_all_ordered(tasks).await;
+                    };
+                    let prepare_humans = async {
+                        tokio::join!(
+                            self.refresh_vote_progress_public(chat_id, VoteProgressKind::Day),
+                            self.ensure_day_vote_cards(chat_id),
+                        );
+                    };
+                    tokio::join!(prepare_humans, ai_votes);
 
-                    // 2. 是否所有人都投了？
+                    // 是否所有人都投了？
                     let all_voted = {
                         let games = self.wolf_games.lock();
                         games.get(chat_id).map(|g| g.all_alive_voted()).unwrap_or(false)
                     };
                     if !all_voted {
-                        // 给还没投的真人发投票卡。已经发过的（day_vote_msgs 里
-                        // 有 msg_id）走 update_card 复用原卡，没发过的才 send。
-                        // 不这样做的话每次有人投完触发 advance_wolf 都会给剩下
-                        // 的人重发一张，3 真人桌剩最后那个会收 N 张卡刷屏。
-                        let humans_pending: Vec<(String, Option<String>)> = {
-                            let games = self.wolf_games.lock();
-                            let Some(g) = games.get(chat_id) else { return };
-                            g.alive_indices()
-                                .into_iter()
-                                .filter(|i| {
-                                    !g.players[*i].is_ai
-                                        && g.day_votes.for_voter(*i).is_none()
-                                })
-                                .map(|i| {
-                                    let oid = g.players[i].open_id.clone();
-                                    let existing = g.day_vote_msg(&oid).map(String::from);
-                                    (oid, existing)
-                                })
-                                .collect()
-                        };
-                        for (oid, existing) in humans_pending {
-                            // 投票卡是静态的（候选不变，看不到别人怎么投）—— 发过一次
-                            // 就别再发了。advance_wolf 每次有人投完都会进这条路径，
-                            // 重发会刷屏。
-                            if existing.is_some() {
-                                continue;
-                            }
-                            let card = {
-                                let games = self.wolf_games.lock();
-                                let Some(g) = games.get(chat_id) else { return };
-                                let Some(p_idx) = g.find_player(&oid) else { continue };
-                                build_vote_card(g, &g.players[p_idx])
-                            };
-                            if let Ok(new_id) = self
-                                .client
-                                .send_ephemeral_card(chat_id, &oid, &card)
-                                .await
-                            {
-                                let mut games = self.wolf_games.lock();
-                                if let Some(g) = games.get_mut(chat_id) {
-                                    g.set_day_vote_msg(&oid, new_id);
-                                    self.persist_wolf_locked(chat_id, g);
-                                }
-                            }
-                        }
                         return;
                     }
 
-                    // 3. 全员投完，结算
+                    // 全员投完，结算
                     let _ = {
                         let mut games = self.wolf_games.lock();
                         let Some(g) = games.get_mut(chat_id) else { return };
@@ -2523,6 +2484,176 @@ impl Bot {
                 speech
             }
             None => String::new(),
+        }
+    }
+
+    /// 串行刷新公开投票进度，避免并发完成的投票互相覆盖成旧状态。
+    async fn refresh_vote_progress_public(&self, chat_id: &str, kind: VoteProgressKind) {
+        let refresh_lock = {
+            let mut locks = self.wolf_vote_refresh_locks.lock();
+            locks
+                .entry(chat_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = refresh_lock.lock().await;
+
+        let (card_value, existing_msg) = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            match kind {
+                VoteProgressKind::Sheriff if g.stage == Stage::SheriffVote => (
+                    build_sheriff_vote_progress_card(g),
+                    g.sheriff_vote_public_msg.clone(),
+                ),
+                VoteProgressKind::Day if g.stage == Stage::DayVote => (
+                    build_day_vote_progress_card(g),
+                    g.day_vote_public_msg.clone(),
+                ),
+                _ => return,
+            }
+        };
+
+        if let Some(msg_id) = existing_msg {
+            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
+                return;
+            }
+        }
+
+        match self
+            .client
+            .send_message("chat_id", chat_id, "interactive", &card_value)
+            .await
+        {
+            Ok(new_id) => {
+                let mut games = self.wolf_games.lock();
+                let Some(g) = games.get_mut(chat_id) else { return };
+                match kind {
+                    VoteProgressKind::Sheriff if g.stage == Stage::SheriffVote => {
+                        g.sheriff_vote_public_msg = Some(new_id);
+                    }
+                    VoteProgressKind::Day if g.stage == Stage::DayVote => {
+                        g.day_vote_public_msg = Some(new_id);
+                    }
+                    _ => return,
+                }
+                self.persist_wolf_locked(chat_id, g);
+            }
+            Err(e) => warn!(?e, %chat_id, "vote progress card send failed"),
+        }
+    }
+
+    async fn ensure_sheriff_vote_cards(&self, chat_id: &str) {
+        let pending: Vec<(String, Value)> = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            if g.stage != Stage::SheriffVote {
+                return;
+            }
+            let candidates = g.sheriff_candidates();
+            g.alive_indices()
+                .into_iter()
+                .filter(|i| {
+                    !g.players[*i].is_ai
+                        && !candidates.contains(i)
+                        && g.sheriff_votes.for_voter(*i).is_none()
+                        && g.sheriff_vote_msg(&g.players[*i].open_id).is_none()
+                })
+                .map(|i| {
+                    let player = &g.players[i];
+                    (player.open_id.clone(), build_sheriff_vote_card(g, player))
+                })
+                .collect()
+        };
+        let results = join_all_ordered(
+            pending
+                .into_iter()
+                .map(|(open_id, card)| async move {
+                    let result = self
+                        .client
+                        .send_ephemeral_card(chat_id, &open_id, &card)
+                        .await;
+                    (open_id, result)
+                })
+                .collect(),
+        )
+        .await;
+
+        let mut games = self.wolf_games.lock();
+        let Some(g) = games.get_mut(chat_id) else { return };
+        if g.stage != Stage::SheriffVote {
+            return;
+        }
+        let mut changed = false;
+        for (open_id, result) in results {
+            match result {
+                Ok(message_id) => {
+                    if g.sheriff_vote_msg(&open_id).is_none() {
+                        g.set_sheriff_vote_msg(&open_id, message_id);
+                        changed = true;
+                    }
+                }
+                Err(e) => warn!(?e, %open_id, "failed to send sheriff vote card"),
+            }
+        }
+        if changed {
+            self.persist_wolf_locked(chat_id, g);
+        }
+    }
+
+    async fn ensure_day_vote_cards(&self, chat_id: &str) {
+        let pending: Vec<(String, Value)> = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            if g.stage != Stage::DayVote {
+                return;
+            }
+            g.alive_indices()
+                .into_iter()
+                .filter(|i| {
+                    !g.players[*i].is_ai
+                        && g.day_votes.for_voter(*i).is_none()
+                        && g.day_vote_msg(&g.players[*i].open_id).is_none()
+                })
+                .map(|i| {
+                    let player = &g.players[i];
+                    (player.open_id.clone(), build_vote_card(g, player))
+                })
+                .collect()
+        };
+        let results = join_all_ordered(
+            pending
+                .into_iter()
+                .map(|(open_id, card)| async move {
+                    let result = self
+                        .client
+                        .send_ephemeral_card(chat_id, &open_id, &card)
+                        .await;
+                    (open_id, result)
+                })
+                .collect(),
+        )
+        .await;
+
+        let mut games = self.wolf_games.lock();
+        let Some(g) = games.get_mut(chat_id) else { return };
+        if g.stage != Stage::DayVote {
+            return;
+        }
+        let mut changed = false;
+        for (open_id, result) in results {
+            match result {
+                Ok(message_id) => {
+                    if g.day_vote_msg(&open_id).is_none() {
+                        g.set_day_vote_msg(&open_id, message_id);
+                        changed = true;
+                    }
+                }
+                Err(e) => warn!(?e, %open_id, "failed to send day vote card"),
+            }
+        }
+        if changed {
+            self.persist_wolf_locked(chat_id, g);
         }
     }
 
