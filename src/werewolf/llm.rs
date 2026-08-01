@@ -36,16 +36,14 @@ pub struct PublicView<'a> {
     pub teammates: Vec<(usize, String, &'static str)>,
     /// 预言家自己的查验历史：(day, target_name, is_wolf)
     pub seer_log: Vec<(u32, String, bool)>,
-    /// 公开事件日志（死讯 / 放逐 / quip 等）。首夜警长竞选期间会过滤未公布死讯。
-    pub event_log: Vec<&'a str>,
+    /// 公开事件日志（死讯 / 放逐 / quip 等）。
+    pub event_log: &'a [String],
     /// **本玩家自己**的所有公开发言（按时间顺序），从 recap_log 提取。
     /// 给后续决策提供"我说过什么"的强信号——避免发言和实际行动冲突。
     pub my_statements: Vec<String>,
     /// 结构化复盘日志（公开 + 私有事件都在内）。render() 时只展示公开部分，
     /// 用来构造每位玩家的发言 + 投票档案，比 event_log 的扁平文本更易解析。
     pub recap_log: &'a [RecapEvent],
-    /// 首夜警长竞选期间尚未公开的死亡玩家。
-    pub hidden_night_deaths: FoldHashSet<usize>,
     /// **本玩家自己**的过往 thinking 历史（从 thinking_log 中过滤）。
     /// 让 AI 在每次决策前能看到自己上几轮的内心独白，保持策略弧线的连贯性。
     /// **严格私密**——只含本玩家的条目，绝不包含其他玩家的 thinking。
@@ -159,7 +157,7 @@ impl<'a> PublicView<'a> {
         // === 事件历史（按时间，作为档案的补充）===
         if !self.event_log.is_empty() {
             out.push_str("\n## 📜 事件历史（按时间）\n");
-            for line in &self.event_log {
+            for line in self.event_log {
                 out.push_str("  ");
                 out.push_str(line);
                 out.push('\n');
@@ -185,6 +183,17 @@ impl<'a> PublicView<'a> {
     fn build_dossiers(&self) -> Vec<(usize, String, bool, Vec<String>)> {
         let mut by_player: FastHashMap<usize, Vec<String>> = FastHashMap::default();
 
+        // 已结算的白天（DayLynch 已写入）—— 这些天的投票才公开，
+        // 当天还在进行中的投票（DayVote 阶段）不能让下一个投票的 AI 偷看。
+        let resolved_lynch_days: FoldHashSet<u32> = self
+            .recap_log
+            .iter()
+            .filter_map(|e| match e {
+                RecapEvent::DayLynch { day, .. } => Some(*day),
+                _ => None,
+            })
+            .collect();
+
         for evt in self.recap_log {
             match evt {
                 RecapEvent::SheriffSpeech { player, text } => {
@@ -193,35 +202,27 @@ impl<'a> PublicView<'a> {
                         .or_default()
                         .push(format!("【上警发言】{}", text));
                 }
-                RecapEvent::SheriffVoteRound { round, votes } => {
-                    for (voter, target) in votes {
-                        let target_str = match target {
-                            Some(t) => self.player_name(*t).unwrap_or("?").to_string(),
-                            None => "弃权".to_string(),
-                        };
-                        by_player.entry(*voter).or_default().push(format!(
-                            "【警长第{}轮投票 →】{}",
-                            round, target_str
-                        ));
-                    }
-                }
                 RecapEvent::DaySpeech { day, player, text } => {
                     by_player
                         .entry(*player)
                         .or_default()
                         .push(format!("【D{} 发言】{}", day, text));
                 }
-                RecapEvent::DayVoteRound { day, round, votes } => {
-                    for (voter, target) in votes {
-                        let target_str = match target {
-                            Some(t) => self.player_name(*t).unwrap_or("?").to_string(),
-                            None => "弃权".to_string(),
-                        };
-                        by_player.entry(*voter).or_default().push(format!(
-                            "【D{} 第{}轮投票 →】{}",
-                            day, round, target_str
-                        ));
+                RecapEvent::DayVoteCast {
+                    day, voter, target, ..
+                } => {
+                    if !resolved_lynch_days.contains(day) {
+                        // 当天投票未结算 —— 个体票面尚未公开，跳过。
+                        continue;
                     }
+                    let target_str = match target {
+                        Some(t) => self.player_name(*t).unwrap_or("?").to_string(),
+                        None => "弃权".to_string(),
+                    };
+                    by_player
+                        .entry(*voter)
+                        .or_default()
+                        .push(format!("【D{} 投票 →】{}", day, target_str));
                 }
                 RecapEvent::LastWords {
                     day,
@@ -280,9 +281,6 @@ impl<'a> PublicView<'a> {
                 cause,
             } = evt
             {
-                if *night && self.hidden_night_deaths.contains(player) {
-                    continue;
-                }
                 let label = if *night {
                     format!("D{} 夜", day)
                 } else {
@@ -326,42 +324,11 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
     let p = &game.players[ai_idx];
     let role = p.role.expect("AI player has role");
 
-    let conceal_first_night_deaths = game.day == 1
-        && matches!(
-            game.stage,
-            Stage::SheriffNominate
-                | Stage::SheriffSpeech
-                | Stage::SheriffWithdraw
-                | Stage::SheriffVote
-        );
-    let hidden_night_deaths = if conceal_first_night_deaths {
-        game.last_night_deaths.iter().copied().collect()
-    } else {
-        FoldHashSet::default()
-    };
-
     let players: Vec<(usize, String, bool)> = game
         .players
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            (
-                i,
-                p.name.clone(),
-                p.alive || hidden_night_deaths.contains(&i),
-            )
-        })
-        .collect();
-
-    let hidden_death_lines: Vec<String> = hidden_night_deaths
-        .iter()
-        .map(|idx| format!("第 {} 夜：{} 死亡", game.day, game.players[*idx].name))
-        .collect();
-    let event_log = game
-        .event_log
-        .iter()
-        .filter(|line| !hidden_death_lines.contains(line))
-        .map(String::as_str)
+        .map(|(i, p)| (i, p.name.clone(), p.alive))
         .collect();
 
     // 狼队友：含狼人 + 狼王（之前 bug：只挑 Werewolf 漏了 WolfKing）
@@ -431,10 +398,9 @@ pub fn build_view<'a>(game: &'a WolfGame, ai_idx: usize) -> PublicView<'a> {
         players,
         teammates,
         seer_log,
-        event_log,
+        event_log: &game.event_log,
         my_statements,
         recap_log: &game.recap_log,
-        hidden_night_deaths,
         my_thinking_history,
     }
 }
@@ -501,17 +467,14 @@ fn persona_line(persona: Option<Persona>) -> String {
 }
 
 const RULES: &str = r#"## 规则速览
-- **胜负（屠边）**：好人胜 = 击杀全部狼（含狼王）；狼胜 = 所有村民或所有神职出局
+- **胜负**：好人胜 = 击杀全部狼（含狼王）；狼胜 = 存活狼 > 存活好人，或 1:1 时警长不在好人手上
 - **角色**：狼人 / 狼王 / 村民 / 预言家 / 女巫 / 猎人 / 守卫
 - **技能**：
   - 预言家每晚验 1 人
   - 女巫一局共 1 瓶救药 + 1 瓶毒药（同晚不可救+毒）
   - 猎人 / 狼王被狼刀或被放逐可开枪，**被毒不能**
-  - 守卫每晚可守 1 人（含自己）或空守，不可连守同人；同守同救会死
-- **狼人行动**：狼队夜杀目标必须一致，否则空刀；狼人白天可以自爆结束当天
+  - 守卫每晚守 1 人（含自己），不可连守同人；同守同救会死
 - **警长** (10+ 板)：1.5x 票权（整数 = 3 vs 普通 2）；死亡时可移交 / 撕毁警徽
-- **平票**：警长投票和放逐首轮平票均进入 PK 发言与复投，第二次平票才流局
-- **暗牌**：普通出局不公开身份，游戏结算时统一揭晓；首夜先竞选警长再公布死讯
 - **预言家查验**：狼王也显示为狼人
 - **公开开枪广播不会标记角色**——猎人和狼王共享开枪技能
 - **只返回单个 JSON 对象，不要任何其他文字 / markdown / 代码块**"#;
@@ -864,14 +827,12 @@ pub struct VoteDecision {
 pub async fn vote_pick(
     llm: &LlmClient,
     view: &PublicView<'_>,
-    game: &WolfGame,
     history: &AttemptHistory,
 ) -> (VoteDecision, Option<String>) {
-    let allowed = game.day_vote_candidates();
     let candidates: Vec<(usize, String)> = view
         .players
         .iter()
-        .filter(|(i, _, alive)| *alive && *i != view.me_idx && allowed.contains(i))
+        .filter(|(i, _, alive)| *alive && *i != view.me_idx)
         .map(|(i, n, _)| (*i, n.clone()))
         .collect();
 
@@ -1603,64 +1564,6 @@ mod tests {
         let s = view.render();
         assert!(s.contains("P0"));
         assert!(s.contains("第 1 天"));
-    }
-
-    #[test]
-    fn first_night_death_is_hidden_during_sheriff_election() {
-        let mut g = WolfGame::new("c".into());
-        for i in 0..10 {
-            g.add_player(format!("p{i}"), format!("P{i}")).unwrap();
-        }
-        g.start_game().unwrap();
-        g.players[9].alive = false;
-        g.last_night_deaths = vec![9];
-        g.event_log.push("第 1 夜：P9 死亡".into());
-        g.recap_log.push(RecapEvent::Death {
-            day: 1,
-            night: true,
-            player: 9,
-            cause: DeathCause::WolfKill,
-        });
-        g.stage = Stage::SheriffNominate;
-
-        let hidden = build_view(&g, 0).render();
-        assert!(hidden.contains("存活："));
-        assert!(hidden.contains("P9"));
-        assert!(!hidden.contains("第 1 夜：P9 死亡"));
-        assert!(!hidden.contains("【D1 夜】夜里死亡"));
-
-        g.stage = Stage::DayReveal;
-        let revealed = build_view(&g, 0).render();
-        assert!(revealed.contains("第 1 夜：P9 死亡"));
-        assert!(revealed.contains("【D1 夜】夜里死亡"));
-    }
-
-    #[test]
-    fn ai_sees_completed_vote_round_but_not_live_revote_ballots() {
-        let mut g = WolfGame::new("c".into());
-        for i in 0..9 {
-            g.add_player(format!("p{i}"), format!("P{i}")).unwrap();
-        }
-        g.start_game().unwrap();
-        g.stage = Stage::DayVote;
-        g.cast_vote("p0", Some("p1")).unwrap();
-        g.cast_vote("p1", Some("p0")).unwrap();
-        g.cast_vote("p2", Some("p1")).unwrap();
-        g.cast_vote("p3", Some("p0")).unwrap();
-        assert_eq!(g.resolve_lynch().unwrap(), None);
-
-        let first_round = build_view(&g, 4).render();
-        assert!(first_round.contains("【D1 第1轮投票 →】P1"));
-        while let Some(candidate) = g.current_day_speaker() {
-            let open_id = g.players[candidate].open_id.clone();
-            g.submit_day_speech(&open_id, "PK".into()).unwrap();
-        }
-        g.enter_day_vote().unwrap();
-        g.cast_vote("p2", Some("p0")).unwrap();
-
-        let revote_in_progress = build_view(&g, 4).render();
-        assert!(revote_in_progress.contains("【D1 第1轮投票 →】P1"));
-        assert!(!revote_in_progress.contains("【D1 第2轮投票 →】"));
     }
 
     #[test]

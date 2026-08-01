@@ -93,19 +93,17 @@ impl Bot {
                      • `wolf leave` 离开房间\n\
                      • `wolf start` 开狼人杀（9-12 名玩家）\n\
                      • `wolf reset` 重置房间\n\n\
-                     **板型配比**：\n\
+                     **板娘配比**：\n\
                      • 9 人：3 狼 / 预 / 女 / 猎 / 3 民（不上警）\n\
                      • 10 人：2 狼 + **狼王** / 预 / 女 / 猎 / **守** / 3 民\n\
                      • 11 人：2 狼 + 狼王 / 预 / 女 / 猎 / 守 / 4 民\n\
                      • 12 人：3 狼 + 狼王 / 预 / 女 / 猎 / 守 / 4 民\n\n\
                      **关键规则**：\n\
-                     • 狼队夜杀目标必须一致，否则空刀；狼人白天可以自爆\n\
-                     • 狼王被投票或狼刀杀死时可开枪，被毒不能\n\
-                     • 守卫可守一人（含自己）或空守，不可连守同一人；同守同救会死\n\
-                     • 首夜先上警再公布死讯；候选可退水，首轮平票进入 PK 复投\n\
-                     • 警长有 1.5 倍票权，死亡可移交 / 撕毁警徽\n\
+                     • 狼王（10+ 板）被投票 / 反向送葬时可开枪，被毒不能\n\
+                     • 守卫每晚守一人（含自己），不可连守同一人；同守同救会死\n\
+                     • 10+ 板第 1 天有上警阶段，警长 1.5 倍票权，死亡可移交 / 撕毁警徽\n\
                      • 猎人被狼刀 / 放逐可开枪，被毒不能\n\n\
-                     胜负：暗牌屠边——全部狼死（含狼王）= 好人胜；村民或神职全部出局 = 狼胜。出局身份仅在结算时公开",
+                     胜负：屠城——全部狼死（含狼王） = 好人胜；存活狼数 ≥ 存活好人数 = 狼胜",
                 ),
                 crate::feishu::cards::note_md(
                     "身份卡 / 夜间技能 / 投票 全部以**仅本人可见**的群消息发出",
@@ -192,28 +190,6 @@ impl Bot {
                 });
                 Ok(toast("已守护"))
             }
-            "wolf_guard_skip" => {
-                let res = {
-                    let mut games = self.wolf_games.lock();
-                    let Some(g) = games.get_mut(&chat_id) else {
-                        return Ok(toast("游戏不存在"));
-                    };
-                    let result = g.guard_skip(&action.open_id);
-                    if result.is_ok() {
-                        self.persist_wolf_locked(&chat_id, g);
-                    }
-                    result
-                };
-                if let Err(error) = res {
-                    return Ok(toast(&error.to_string()));
-                }
-                let bot = self.clone();
-                let cid = chat_id.clone();
-                tokio::spawn(async move {
-                    bot.advance_wolf(&cid).await;
-                });
-                Ok(toast("今晚空守"))
-            }
             "wolf_kill" => {
                 let target = match target_open_id {
                     Some(t) => t,
@@ -289,14 +265,6 @@ impl Bot {
             }
             "wolf_sheriff_run" => self.sheriff_nominate_and_advance(&chat_id, &action.open_id, true).await,
             "wolf_sheriff_skip" => self.sheriff_nominate_and_advance(&chat_id, &action.open_id, false).await,
-            "wolf_sheriff_stay" => {
-                self.sheriff_withdraw_and_advance(&chat_id, &action.open_id, true)
-                    .await
-            }
-            "wolf_sheriff_withdraw" => {
-                self.sheriff_withdraw_and_advance(&chat_id, &action.open_id, false)
-                    .await
-            }
             "wolf_sheriff_speech_submit" => {
                 let speech = action
                     .form_value
@@ -482,37 +450,6 @@ impl Bot {
                 self.hunter_shoot_and_advance(&chat_id, &action.open_id, None)
                     .await
             }
-            "wolf_self_explode" => {
-                let exploded = {
-                    let mut games = self.wolf_games.lock();
-                    let Some(g) = games.get_mut(&chat_id) else {
-                        return Ok(toast("游戏不存在"));
-                    };
-                    match g.self_explode(&action.open_id) {
-                        Ok(idx) => {
-                            let player = g.players[idx].clone();
-                            self.persist_wolf_locked(&chat_id, g);
-                            Ok(player)
-                        }
-                        Err(error) => Err(error),
-                    }
-                };
-                let player = match exploded {
-                    Ok(player) => player,
-                    Err(error) => return Ok(toast(&error.to_string())),
-                };
-                let announce = build_self_explode_announce_card(&player);
-                let _ = self
-                    .client
-                    .send_message("chat_id", &chat_id, "interactive", &announce)
-                    .await;
-                let bot = self.clone();
-                let cid = chat_id.clone();
-                tokio::spawn(async move {
-                    bot.advance_wolf(&cid).await;
-                });
-                Ok(toast("已自爆"))
-            }
             _ => Ok(json!({})),
         }
     }
@@ -696,34 +633,6 @@ impl Bot {
             bot.advance_wolf(&cid).await;
         });
         Ok(toast(if running { "已上警" } else { "未上警" }))
-    }
-
-    async fn sheriff_withdraw_and_advance(
-        self: &std::sync::Arc<Self>,
-        chat_id: &str,
-        candidate_open_id: &str,
-        stay: bool,
-    ) -> Result<Value> {
-        let result = {
-            let mut games = self.wolf_games.lock();
-            let Some(game) = games.get_mut(chat_id) else {
-                return Ok(toast("游戏不存在"));
-            };
-            let result = game.decide_sheriff_withdraw(candidate_open_id, stay);
-            if result.is_ok() {
-                self.persist_wolf_locked(chat_id, game);
-            }
-            result
-        };
-        if let Err(error) = result {
-            return Ok(toast(&error.to_string()));
-        }
-        let bot = self.clone();
-        let cid = chat_id.to_string();
-        tokio::spawn(async move {
-            bot.advance_wolf(&cid).await;
-        });
-        Ok(toast(if stay { "继续竞选" } else { "已退水" }))
     }
 
     async fn sheriff_vote_and_advance(
@@ -919,17 +828,13 @@ impl Bot {
                     | Stage::WolvesPick
                     | Stage::SeerPick
                     | Stage::WitchAct
-                    | Stage::SheriffNominate
                     | Stage::DayReveal
             ) {
                 self.refresh_night_progress_public(chat_id).await;
             }
             if matches!(
                 stage_now,
-                Stage::SheriffWithdraw
-                    | Stage::SheriffPickDirection
-                    | Stage::HunterShoot
-                    | Stage::BadgePass
+                Stage::SheriffPickDirection | Stage::HunterShoot | Stage::BadgePass
             ) {
                 self.refresh_single_action_progress_public(chat_id).await;
             }
@@ -1051,7 +956,7 @@ impl Bot {
                     let pending_ais: Vec<(usize, String)> = {
                         let games = self.wolf_games.lock();
                         let Some(g) = games.get(chat_id) else { return };
-                        g.sheriff_eligible_indices()
+                        g.alive_indices()
                             .into_iter()
                             .filter(|i| {
                                 g.players[*i].is_ai
@@ -1112,25 +1017,12 @@ impl Bot {
                             .send_message("chat_id", chat_id, "interactive", &c)
                             .await;
                     }
-                    let result_game = {
+                    {
                         let mut games = self.wolf_games.lock();
                         if let Some(g) = games.get_mut(chat_id) {
-                            if let Err(error) = g.finish_sheriff_nominate() {
-                                warn!(?error, "finish_sheriff_nominate failed");
-                                return;
-                            }
+                            let _ = g.finish_sheriff_nominate();
                             self.persist_wolf_locked(chat_id, g);
-                            (g.stage == Stage::DayReveal).then(|| g.clone())
-                        } else {
-                            None
                         }
-                    };
-                    if let Some(game) = result_game {
-                        let card = build_sheriff_result_card(&game);
-                        let _ = self
-                            .client
-                            .send_message("chat_id", chat_id, "interactive", &card)
-                            .await;
                     }
                 }
 
@@ -1138,10 +1030,12 @@ impl Bot {
                     let pending_ais: Vec<(usize, String)> = {
                         let games = self.wolf_games.lock();
                         let Some(g) = games.get(chat_id) else { return };
-                        g.sheriff_voters()
+                        let candidates = g.sheriff_candidates();
+                        g.alive_indices()
                             .into_iter()
                             .filter(|i| {
                                 g.players[*i].is_ai
+                                    && !candidates.contains(i)
                                     && g.sheriff_votes.for_voter(*i).is_none()
                             })
                             .map(|i| (i, g.players[i].open_id.clone()))
@@ -1234,86 +1128,12 @@ impl Bot {
                         return;
                     }
 
-                    let result_game = {
+                    {
                         let mut games = self.wolf_games.lock();
                         if let Some(g) = games.get_mut(chat_id) {
-                            if let Err(error) = g.resolve_sheriff_vote() {
-                                warn!(?error, "resolve_sheriff_vote failed");
-                                return;
-                            }
+                            let _ = g.resolve_sheriff_vote();
                             self.persist_wolf_locked(chat_id, g);
-                            Some(g.clone())
-                        } else {
-                            None
                         }
-                    };
-                    if let Some(game) = result_game {
-                        let card = build_sheriff_result_card(&game);
-                        let _ = self
-                            .client
-                            .send_message("chat_id", chat_id, "interactive", &card)
-                            .await;
-                    }
-                }
-
-                Stage::SheriffWithdraw => {
-                    let current = {
-                        let games = self.wolf_games.lock();
-                        let Some(game) = games.get(chat_id) else { return };
-                        game.current_sheriff_withdrawer().map(|idx| {
-                            let player = &game.players[idx];
-                            (idx, player.open_id.clone(), player.is_ai, player.role)
-                        })
-                    };
-                    let Some((idx, open_id, is_ai, role)) = current else {
-                        let result_game = {
-                            let mut games = self.wolf_games.lock();
-                            if let Some(game) = games.get_mut(chat_id) {
-                                if let Err(error) = game.finish_sheriff_withdraw() {
-                                    warn!(?error, "finish_sheriff_withdraw failed");
-                                    return;
-                                }
-                                self.persist_wolf_locked(chat_id, game);
-                                (game.stage == Stage::DayReveal).then(|| game.clone())
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(game) = result_game {
-                            let card = build_sheriff_result_card(&game);
-                            let _ = self
-                                .client
-                                .send_message("chat_id", chat_id, "interactive", &card)
-                                .await;
-                        }
-                        continue;
-                    };
-
-                    if is_ai {
-                        // 预言家与狼阵营默认留在警上，其余角色默认退水。
-                        let stay = role == Some(Role::Seer)
-                            || role.map(Role::is_wolf).unwrap_or(false);
-                        let mut games = self.wolf_games.lock();
-                        if let Some(game) = games.get_mut(chat_id) {
-                            if let Err(error) = game.decide_sheriff_withdraw(&open_id, stay) {
-                                warn!(?error, idx, "AI sheriff withdraw decision failed");
-                                return;
-                            }
-                            self.persist_wolf_locked(chat_id, game);
-                        }
-                    } else {
-                        let game = {
-                            let games = self.wolf_games.lock();
-                            games.get(chat_id).cloned()
-                        };
-                        if let Some(game) = game {
-                            let card = build_sheriff_withdraw_card(&game, &game.players[idx]);
-                            let _ = self
-                                .client
-                                .send_ephemeral_card(chat_id, &open_id, &card)
-                                .await;
-                        }
-                        return;
                     }
                 }
 
@@ -1880,8 +1700,22 @@ impl Bot {
                         let mut games = self.wolf_games.lock();
                         if let Some(g) = games.get_mut(chat_id) {
                             if let Err(e) = g.finish_last_words() {
-                                warn!(?e, "finish_last_words failed");
-                                return;
+                                warn!(?e, "finish_last_words failed, force-routing");
+                                // 兜底：手动按 finish_last_words 的逻辑切 stage
+                                if g.pending_hunter.is_some() {
+                                    g.stage = Stage::HunterShoot;
+                                } else if g.pending_badge.is_some() {
+                                    g.stage = Stage::BadgePass;
+                                } else {
+                                    let post = g.last_words_post_stage.take();
+                                    match post {
+                                        Some(Stage::DayReveal) => g.stage = Stage::DayReveal,
+                                        _ => {
+                                            // 进下一夜：直接调 advance_to_next_night_or_end 等价物
+                                            g.stage = Stage::DayReveal; // 安全兜底
+                                        }
+                                    }
+                                }
                             }
                             self.persist_wolf_locked(chat_id, g);
                         }
@@ -1943,19 +1777,14 @@ impl Bot {
                         })
                     };
                     let Some((spk_idx, spk_oid, is_ai)) = current else {
-                        // 首轮发言后进入退水，PK 发言后进入复投。
+                        // 全部说完 → 进警长投票
                         {
                             let mut games = self.wolf_games.lock();
                             if let Some(g) = games.get_mut(chat_id) {
                                 if let Err(e) = g.finish_sheriff_speeches() {
-                                    warn!(?e, "finish_sheriff_speeches failed, force-advancing");
-                                    if g.sheriff_vote_round == 0 {
-                                        g.sheriff_withdrawals.clear();
-                                        g.stage = Stage::SheriffWithdraw;
-                                    } else {
-                                        g.stage = Stage::SheriffVote;
-                                        g.sheriff_votes.clear();
-                                    }
+                                    warn!(?e, "finish_sheriff_speeches failed, force-advancing to SheriffVote");
+                                    g.stage = Stage::SheriffVote;
+                                    g.sheriff_votes.clear();
                                 }
                                 self.persist_wolf_locked(chat_id, g);
                             }
@@ -2062,7 +1891,7 @@ impl Bot {
                     let pending_ais: Vec<(usize, String)> = {
                         let games = self.wolf_games.lock();
                         let Some(g) = games.get(chat_id) else { return };
-                        g.day_voters()
+                        g.alive_indices()
                             .into_iter()
                             .filter(|i| {
                                 g.players[*i].is_ai && g.day_votes.for_voter(*i).is_none()
@@ -2522,8 +2351,7 @@ impl Bot {
         let view = wolf_llm::build_view(&game, ai_idx);
         match &self.llm {
             Some(llm) => {
-                let (decision, thinking) =
-                    wolf_llm::vote_pick(llm, &view, &game, history).await;
+                let (decision, thinking) = wolf_llm::vote_pick(llm, &view, history).await;
                 self.save_thinking(chat_id, ai_idx, ThinkingKind::DayVote, thinking);
                 decision
             }
@@ -2745,12 +2573,6 @@ impl Bot {
             let games = self.wolf_games.lock();
             let Some(g) = games.get(chat_id) else { return };
             let (actor_idx, title, action, template) = match g.stage {
-                Stage::SheriffWithdraw => (
-                    g.current_sheriff_withdrawer(),
-                    "🎖️ 等待退水决定",
-                    "决定继续竞选或退水",
-                    "yellow",
-                ),
                 Stage::SheriffPickDirection => (
                     g.sheriff_idx,
                     "🎖️ 等待警长指示",
@@ -2889,7 +2711,7 @@ impl Bot {
             if g.stage != Stage::SheriffNominate {
                 return;
             }
-            g.sheriff_eligible_indices()
+            g.alive_indices()
                 .into_iter()
                 .filter(|i| {
                     !g.players[*i].is_ai
@@ -2953,10 +2775,12 @@ impl Bot {
             if g.stage != Stage::SheriffVote {
                 return;
             }
-            g.sheriff_voters()
+            let candidates = g.sheriff_candidates();
+            g.alive_indices()
                 .into_iter()
                 .filter(|i| {
                     !g.players[*i].is_ai
+                        && !candidates.contains(i)
                         && g.sheriff_votes.for_voter(*i).is_none()
                         && g.sheriff_vote_msg(&g.players[*i].open_id).is_none()
                 })
@@ -3009,7 +2833,7 @@ impl Bot {
             if g.stage != Stage::DayVote {
                 return;
             }
-            g.day_voters()
+            g.alive_indices()
                 .into_iter()
                 .filter(|i| {
                     !g.players[*i].is_ai

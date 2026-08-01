@@ -1,15 +1,15 @@
 //! 狼人杀 (Werewolf) game state machine.
 //!
-//! 屠边规则：
+//! 屠城规则：
 //! - 好人胜：所有狼人死亡
-//! - 狼人胜：所有村民死亡，或所有神职死亡
+//! - 狼人胜：存活狼人 ≥ 存活好人
 //!
 //! 角色：狼人 / 村民 / 预言家 / 女巫 / 猎人
 //!
 //! 阶段（每天循环）：
-//! GuardPick → WolvesPick → SeerPick → WitchAct
-//! → SheriffNominate / SheriffSpeech / SheriffWithdraw / SheriffVote (首夜 10+ 人板)
-//! → DayReveal → DaySpeech → DayVote → (PK speech / revote when tied)
+//! WolvesPick → SeerPick → WitchAct → DayReveal
+//! → (HunterShoot if hunter died)
+//! → SheriffSpeech (10+ 板) → SheriffVote → DaySpeech → DayVote → DayLynch
 //! → (HunterShoot if hunter lynched)
 //! → 检查胜负 → 下一夜 / Ended
 
@@ -32,7 +32,7 @@ fn shuffle_in_place<T>(slice: &mut [T]) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Werewolf,
-    /// 狼王：狼阵营，被投票或狼刀杀死时可开枪带走一人；被毒不能开枪。
+    /// 狼王：狼阵营，被投票或被狼刀杀死时可开枪带走一人；被毒不能开枪。
     WolfKing,
     Villager,
     Seer,
@@ -68,13 +68,13 @@ impl Role {
 
     pub fn description(self) -> &'static str {
         match self {
-            Role::Werewolf => "夜晚和狼队友统一击杀目标；未统一则空刀。白天可以自爆，立即结束当天。",
-            Role::WolfKing => "狼阵营。夜晚参与统一击杀目标，白天可以自爆。被投票放逐或狼刀杀死时可开枪带走一人；**被毒不能开枪**。预言家查验显示为狼。",
+            Role::Werewolf => "夜晚和狼队友一起决定要杀的人。白天伪装成好人混进投票。",
+            Role::WolfKing => "狼阵营。和其他狼一起夜里杀人。被投票放逐 / 被同伴反水（罕见）/ 被狼刀（不会发生）时可开枪带走一人；**被毒不能开枪**。预言家查验显示为狼。",
             Role::Villager => "没有夜间技能。靠白天投票把狼找出来。",
             Role::Seer => "每晚可以查验一名玩家的身份（狼人 / 好人）。",
             Role::Witch => "知道当晚狼人要杀谁，可选用救药救人（仅 1 次，全局），或用毒药毒一人（仅 1 次，全局）。同晚不可同时救+毒。",
             Role::Hunter => "被投票放逐 / 被狼人杀害时可开枪带走任意一名玩家。被毒杀则不能开枪。",
-            Role::Guard => "每晚可以守护一名存活玩家（含自己）或空守，不能连续两晚守同一个人。同守同救：被守 + 被救者依然死亡。",
+            Role::Guard => "每晚守护一名存活玩家（含自己），不能连续两晚守同一个人。同守同救：被守 + 被救者依然死亡。",
         }
     }
 
@@ -83,7 +83,7 @@ impl Role {
     }
 }
 
-/// 给定玩家数量的项目板型配比（9-12 人）。
+/// 给定玩家数量的角色配比（标准 9-12 人板）。
 ///
 /// - 9 人：3 狼 + 预言家 + 女巫 + 猎人 + 3 村民（不上警）
 /// - 10 人：2 狼 + **狼王** + 预言家 + 女巫 + 猎人 + 守卫 + 3 村民
@@ -136,8 +136,6 @@ pub enum Stage {
     SheriffNominate,
     /// 白天 1——警长候选人轮流竞选发言。
     SheriffSpeech,
-    /// 白天 1——警长候选人发言后依次决定退水 / 留在警上。
-    SheriffWithdraw,
     /// 白天 1——上警投票：非候选人投出警长。
     SheriffVote,
     /// 警长产生后选择白天发言方向（警上 / 警下）。
@@ -146,7 +144,7 @@ pub enum Stage {
     DaySpeech,
     /// 白天——投票放逐。
     DayVote,
-    /// 死亡遗言：首夜死亡者和白天被放逐者依次说话；后续夜间死亡者无遗言。
+    /// 死亡遗言：被狼刀 / 放逐者依次说话。被毒 / 被开枪者无遗言。
     LastWords,
     /// 猎人开枪（被杀 / 被放逐时触发，被毒不触发）。
     HunterShoot,
@@ -167,7 +165,6 @@ impl Stage {
             Stage::DayReveal => "白天·公布死讯",
             Stage::SheriffNominate => "白天·上警阶段",
             Stage::SheriffSpeech => "白天·上警发言",
-            Stage::SheriffWithdraw => "白天·上警退水",
             Stage::SheriffVote => "白天·警长投票",
             Stage::SheriffPickDirection => "白天·警长选择方向",
             Stage::DaySpeech => "白天·轮流发言",
@@ -204,8 +201,6 @@ pub enum DeathCause {
     Lynch,
     /// 被猎人开枪带走。
     HunterShot,
-    /// 狼人在白天自爆。
-    SelfExplode,
 }
 
 impl DeathCause {
@@ -215,7 +210,6 @@ impl DeathCause {
             DeathCause::Poison => "被毒杀",
             DeathCause::Lynch => "被投票放逐",
             DeathCause::HunterShot => "被猎人开枪带走",
-            DeathCause::SelfExplode => "狼人自爆",
         }
     }
 }
@@ -375,31 +369,9 @@ pub struct WolfGame {
     /// 上警发言时给当前候选人的 ephemeral 卡 message_id。
     #[serde(default)]
     pub sheriff_speech_private_msg: Option<String>,
-    /// 所有最初上警的玩家；退水后仍不能参与警长投票。
-    #[serde(default)]
-    pub sheriff_original_candidates: Vec<usize>,
-    /// 候选人的退水决定：(candidate_idx, stay_on_ballot)。
-    #[serde(default)]
-    pub sheriff_withdrawals: Vec<(usize, bool)>,
-    /// 警长投票轮次：0 = 首轮，1 = 平票 PK 轮。
-    #[serde(default)]
-    pub sheriff_vote_round: u8,
-    /// 警长平票 PK 候选人。
-    #[serde(default)]
-    pub sheriff_pk_candidates: Vec<usize>,
-
-    /// 放逐投票轮次：0 = 首轮，1 = 平票 PK 轮。
-    #[serde(default)]
-    pub day_vote_round: u8,
-    /// 放逐平票 PK 候选人。
-    #[serde(default)]
-    pub day_pk_candidates: Vec<usize>,
-    /// 警长竞选期间狼人自爆后，处理完首夜死讯/遗言便直接入夜。
-    #[serde(default)]
-    pub skip_day_after_reveal: bool,
 
     // ---- 死亡遗言 ----
-    /// 待说遗言的玩家队列（按死亡顺序）。首夜死亡者及白天被放逐者进入队列。
+    /// 待说遗言的玩家队列（按死亡顺序）。被毒 / 被开枪者不在内。
     #[serde(default)]
     pub last_words_queue: Vec<usize>,
     #[serde(default)]
@@ -410,7 +382,7 @@ pub struct WolfGame {
     pub last_words_public_msg: Option<String>,
     #[serde(default)]
     pub last_words_private_msg: Option<String>,
-    /// 遗言全部说完后回到哪个阶段（DaySpeech / DayVote 等）。
+    /// 遗言全部说完后回到哪个阶段（DayReveal / DayVote 等）。
     #[serde(default)]
     pub last_words_post_stage: Option<Stage>,
     /// 待移交警徽的玩家（即将死亡的警长）。
@@ -423,7 +395,7 @@ pub struct WolfGame {
     // ---- 猎人临牌 ----
     /// 待开枪的猎人玩家索引；进入 `HunterShoot` 阶段后由这个字段标识谁需要开枪。
     pub pending_hunter: Option<usize>,
-    /// 猎人因什么死的，决定开枪后回到哪个阶段（夜间死亡→白天发言；白天死亡→检查胜负后进夜晚）。
+    /// 猎人因什么死的，决定开枪后回到哪个阶段（晚上死了→白天揭晓；白天死了→检查胜负后进夜晚）。
     pub pending_hunter_post_stage: Option<Stage>,
     /// AI 在遗言阶段就一并决策的开枪目标，HunterShoot 阶段直接使用而不再调一次 LLM。
     /// 语义：`None` = 还没决策；`Some(None)` = 决策不开枪；`Some(Some(idx))` = 决策打 idx。
@@ -524,11 +496,6 @@ pub enum RecapEvent {
     SheriffCandidates { candidates: Vec<usize> },
     /// 上警发言（候选人）
     SheriffSpeech { player: usize, text: String },
-    /// 已结算并公开的一轮警长票型；round 从 1 开始。
-    SheriffVoteRound {
-        round: u8,
-        votes: Vec<(usize, Option<usize>)>,
-    },
     /// 警长当选（None = 流局）
     SheriffElected { player: Option<usize> },
     /// 警长选起手方向（true = 警上 / 顺时针）
@@ -537,12 +504,6 @@ pub enum RecapEvent {
     DaySpeech { day: u32, player: usize, text: String },
     /// 单条投票（含权重，警长 = 3，普通 = 2）
     DayVoteCast { day: u32, voter: usize, target: Option<usize>, weight: u32 },
-    /// 已结算并公开的一轮票型；round 从 1 开始。
-    DayVoteRound {
-        day: u32,
-        round: u8,
-        votes: Vec<(usize, Option<usize>)>,
-    },
     /// 当天放逐结果（None = 平票 / 全弃权流局）
     DayLynch { day: u32, target: Option<usize> },
     /// 猎人 / 狼王开枪
@@ -598,13 +559,6 @@ impl WolfGame {
             sheriff_speeches: vec![],
             sheriff_speech_public_msg: None,
             sheriff_speech_private_msg: None,
-            sheriff_original_candidates: vec![],
-            sheriff_withdrawals: vec![],
-            sheriff_vote_round: 0,
-            sheriff_pk_candidates: vec![],
-            day_vote_round: 0,
-            day_pk_candidates: vec![],
-            skip_day_after_reveal: false,
             last_words_queue: vec![],
             last_words_idx: 0,
             last_words_speeches: vec![],
@@ -713,6 +667,13 @@ impl WolfGame {
         self.alive_wolves().len()
     }
 
+    pub fn alive_good_count(&self) -> usize {
+        self.players
+            .iter()
+            .filter(|p| p.alive && p.role.map(|r| !r.is_wolf()).unwrap_or(false))
+            .count()
+    }
+
     pub fn role_idx(&self, role: Role) -> Option<usize> {
         self.players.iter().position(|p| p.role == Some(role))
     }
@@ -726,11 +687,7 @@ impl WolfGame {
     }
 
     pub fn is_wolf(&self, idx: usize) -> bool {
-        self.players
-            .get(idx)
-            .and_then(|p| p.role)
-            .map(Role::is_wolf)
-            .unwrap_or(false)
+        self.players.get(idx).and_then(|p| p.role) == Some(Role::Werewolf)
     }
 
     pub fn is_guard(&self, idx: usize) -> bool {
@@ -798,13 +755,6 @@ impl WolfGame {
         self.sheriff_speeches.clear();
         self.sheriff_speech_public_msg = None;
         self.sheriff_speech_private_msg = None;
-        self.sheriff_original_candidates.clear();
-        self.sheriff_withdrawals.clear();
-        self.sheriff_vote_round = 0;
-        self.sheriff_pk_candidates.clear();
-        self.day_vote_round = 0;
-        self.day_pk_candidates.clear();
-        self.skip_day_after_reveal = false;
         self.last_words_queue.clear();
         self.last_words_idx = 0;
         self.last_words_speeches.clear();
@@ -863,23 +813,6 @@ impl WolfGame {
         Ok(())
     }
 
-    /// 守卫选择空守。空守会打断连续守护，下一晚可重新守上一名目标。
-    pub fn guard_skip(&mut self, guard_open_id: &str) -> Result<()> {
-        if self.stage != Stage::GuardPick {
-            return Err(anyhow!("当前不是守卫阶段"));
-        }
-        let g_idx = self
-            .find_player(guard_open_id)
-            .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if !self.is_guard(g_idx) || !self.players[g_idx].alive {
-            return Err(anyhow!("你不是存活的守卫"));
-        }
-        self.guard_target = None;
-        self.last_guard_target = None;
-        self.stage = Stage::WolvesPick;
-        Ok(())
-    }
-
     /// 狼人提交击杀目标。提交后若所有狼人都已投票，则计算最终目标并进入下一阶段。
     pub fn wolf_pick(&mut self, wolf_open_id: &str, target_open_id: &str) -> Result<()> {
         if self.stage != Stage::WolvesPick {
@@ -890,9 +823,6 @@ impl WolfGame {
             .ok_or_else(|| anyhow!("你不在桌上"))?;
         if !self.is_wolf(wolf_idx) || !self.players[wolf_idx].alive {
             return Err(anyhow!("你不是存活的狼人"));
-        }
-        if self.is_wolf_ready(wolf_idx) {
-            return Err(anyhow!("你已确认目标，不能再修改"));
         }
         let target_idx = self
             .find_player(target_open_id)
@@ -990,31 +920,28 @@ impl WolfGame {
             .map(|(_, id)| id.as_str())
     }
 
-    /// 解析狼人目标。所有存活狼人必须统一意见，否则视为空刀。
+    /// 解析狼人投票得出最终猎物：取最高票，平票随机。
     fn resolve_wolf_kill(&mut self) {
-        let alive_wolves = self.alive_wolves();
-        if alive_wolves.is_empty()
-            || alive_wolves
-                .iter()
-                .any(|wolf| !self.wolf_kill_votes.iter().any(|(voter, _)| voter == wolf))
-        {
+        if self.wolf_kill_votes.is_empty() {
             self.night_victim = None;
             return;
         }
-        let first = self
-            .wolf_kill_votes
+        let mut tally: Vec<(usize, u32)> = vec![];
+        for (_, target) in &self.wolf_kill_votes {
+            if let Some(slot) = tally.iter_mut().find(|(t, _)| t == target) {
+                slot.1 += 1;
+            } else {
+                tally.push((*target, 1));
+            }
+        }
+        let max = tally.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let candidates: Vec<usize> = tally
             .iter()
-            .find(|(voter, _)| alive_wolves.contains(voter))
-            .map(|(_, target)| *target);
-        self.night_victim = first.filter(|target| {
-            alive_wolves.iter().all(|wolf| {
-                self.wolf_kill_votes
-                    .iter()
-                    .find(|(voter, _)| voter == wolf)
-                    .map(|(_, picked)| picked == target)
-                    .unwrap_or(false)
-            })
-        });
+            .filter(|(_, c)| *c == max)
+            .map(|(t, _)| *t)
+            .collect();
+        let chosen = candidates[fastrand::usize(0..candidates.len())];
+        self.night_victim = Some(chosen);
     }
 
     /// 狼阶段全部结束后调用：解析猎物，进入下一阶段（预言家 / 女巫 / 白天）。
@@ -1122,7 +1049,7 @@ impl WolfGame {
         Ok(())
     }
 
-    /// 计算夜晚最终死亡者。首日先上警，之后才公开死讯并处理遗言/技能。
+    /// 计算夜晚最终死亡者，进入白天阶段。如有猎人死于狼刀，先进入 HunterShoot。
     fn resolve_night(&mut self) {
         let mut deaths: Vec<(usize, DeathCause)> = vec![];
 
@@ -1191,7 +1118,7 @@ impl WolfGame {
         });
         if let Some((h_idx, _)) = shooter_just_died {
             self.pending_hunter = Some(*h_idx);
-            self.pending_hunter_post_stage = Some(Stage::DaySpeech);
+            self.pending_hunter_post_stage = Some(Stage::DayReveal);
         }
         // 2. 警长死亡（任何死法）→ 警徽流转
         let sheriff_just_died = deaths
@@ -1199,28 +1126,20 @@ impl WolfGame {
             .find(|(i, _)| Some(*i) == self.sheriff_idx);
         if let Some((s_idx, _)) = sheriff_just_died {
             self.pending_badge = Some(*s_idx);
-            self.pending_badge_post_stage = Some(Stage::DaySpeech);
+            self.pending_badge_post_stage = Some(Stage::DayReveal);
         }
 
-        // 首夜所有夜间死亡者有遗言；之后的夜间死亡者没有遗言。
-        self.last_words_queue = if self.day == 1 {
-            deaths.iter().map(|(idx, _)| *idx).collect()
+        // 3. 路由：夜里死的人**不发表遗言**（全部静默）——遗言只发生在白天放逐。
+        //    例外：猎人/狼王 单独走 HunterShoot 阶段，由 dying_hunter_combined
+        //    一次性输出『临死一句话 + 开枪目标』，那一句话同时充当临终信号；
+        //    被开枪带走者本身也无遗言（与放逐不同）。
+        if self.pending_hunter.is_some() {
+            self.stage = Stage::HunterShoot;
+        } else if self.pending_badge.is_some() {
+            self.stage = Stage::BadgePass;
         } else {
-            vec![]
-        };
-        self.last_words_idx = 0;
-        self.last_words_speeches.clear();
-        self.last_words_post_stage = Some(Stage::DaySpeech);
-
-        // 标准流程：首夜先竞选警长，再公布死讯。
-        self.stage = if self.day == 1 && self.sheriff_enabled && self.sheriff_idx.is_none() {
-            self.sheriff_nominations.clear();
-            self.sheriff_nominate_msgs.clear();
-            self.sheriff_nominate_public_msg = None;
-            Stage::SheriffNominate
-        } else {
-            Stage::DayReveal
-        };
+            self.stage = Stage::DayReveal;
+        }
     }
 
     /// 选择夜晚下一阶段。当前阶段已结束，根据剩余角色决定去哪。
@@ -1263,49 +1182,20 @@ impl WolfGame {
         self.stage = next;
     }
 
-    /// 公布死讯后处理首夜遗言、开枪与警徽，再开始白天发言。
+    /// 从 DayReveal 推进。第 1 天且启用警长 → 上警阶段；否则直接发言。
     pub fn enter_day_discuss(&mut self) -> Result<()> {
         if self.stage != Stage::DayReveal {
             return Err(anyhow!("当前不是 DayReveal 阶段"));
         }
-        if self.pending_badge.is_none() {
-            if let Some(sheriff) = self.sheriff_idx.filter(|idx| !self.players[*idx].alive) {
-                self.pending_badge = Some(sheriff);
-            }
-        }
-
-        let post_stage = if self.skip_day_after_reveal {
-            Stage::DayVote
-        } else {
-            Stage::DaySpeech
-        };
-        self.last_words_post_stage = Some(post_stage);
-        if self.pending_hunter.is_some() {
-            self.pending_hunter_post_stage = Some(post_stage);
-        }
-        if self.pending_badge.is_some() {
-            self.pending_badge_post_stage = Some(post_stage);
-        }
-
-        if !self.last_words_queue.is_empty() {
-            self.stage = Stage::LastWords;
-            return Ok(());
-        }
-        if self.pending_hunter.is_some() {
-            self.stage = Stage::HunterShoot;
-            return Ok(());
-        }
-        if self.pending_badge.is_some() {
-            self.stage = Stage::BadgePass;
-            return Ok(());
-        }
-        if self.skip_day_after_reveal {
-            self.skip_day_after_reveal = false;
-            self.advance_to_next_night_or_end();
-            return Ok(());
-        }
-        if self.victory().is_some() {
+        if let Some(_winner) = self.victory() {
             self.stage = Stage::Ended;
+            return Ok(());
+        }
+        if self.day == 1 && self.sheriff_enabled && self.sheriff_idx.is_none() {
+            self.stage = Stage::SheriffNominate;
+            self.sheriff_nominations.clear();
+            self.sheriff_nominate_msgs.clear();
+            self.sheriff_nominate_public_msg = None;
             return Ok(());
         }
         self.start_day_speech();
@@ -1316,8 +1206,6 @@ impl WolfGame {
     /// - 警长存活 → SheriffPickDirection（警长选警上 / 警下）
     /// - 没警长 → 随机起点 + 顺时针，直接 DaySpeech
     fn start_day_speech(&mut self) {
-        self.day_vote_round = 0;
-        self.day_pk_candidates.clear();
         let n = self.players.len();
         if let Some(_) = self.sheriff_idx.filter(|s| self.players[*s].alive) {
             self.stage = Stage::SheriffPickDirection;
@@ -1448,8 +1336,8 @@ impl WolfGame {
         let idx = self
             .find_player(voter_open_id)
             .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if !self.sheriff_eligible_indices().contains(&idx) {
-            return Err(anyhow!("你不能参与本次上警"));
+        if !self.players[idx].alive {
+            return Err(anyhow!("死人不能上警"));
         }
         if let Some(slot) = self.sheriff_nominations.iter_mut().find(|(i, _)| *i == idx) {
             slot.1 = running;
@@ -1460,21 +1348,9 @@ impl WolfGame {
     }
 
     pub fn all_alive_nominated(&self) -> bool {
-        self.sheriff_eligible_indices().iter().all(|i| {
+        self.alive_indices().iter().all(|i| {
             self.sheriff_nominations.iter().any(|(idx, _)| idx == i)
         })
-    }
-
-    /// 首日警长竞选发生在死讯公布前，因此首夜死亡者仍参与竞选。
-    pub fn sheriff_eligible_indices(&self) -> Vec<usize> {
-        self.players
-            .iter()
-            .enumerate()
-            .filter(|(idx, player)| {
-                player.alive || (self.day == 1 && self.last_night_deaths.contains(idx))
-            })
-            .map(|(idx, _)| idx)
-            .collect()
     }
 
     pub fn set_sheriff_nominate_msg(&mut self, open_id: &str, msg_id: String) {
@@ -1498,9 +1374,6 @@ impl WolfGame {
     }
 
     pub fn sheriff_candidates(&self) -> Vec<usize> {
-        if self.sheriff_vote_round == 1 && !self.sheriff_pk_candidates.is_empty() {
-            return self.sheriff_pk_candidates.clone();
-        }
         self.sheriff_nominations
             .iter()
             .filter(|(_, run)| *run)
@@ -1509,17 +1382,14 @@ impl WolfGame {
     }
 
     /// 上警阶段结束。
-    /// - ≥ 2 名候选 → 竞选发言，随后进入退水阶段
-    /// - 1 名 → 直接当选
-    /// - 0 名 → 无警长
+    /// - ≥ 2 名候选 → 进竞选发言（SheriffSpeech）
+    /// - 1 名 → 直接当选 → 白天发言
+    /// - 0 名 → 无警长 → 白天发言
     pub fn finish_sheriff_nominate(&mut self) -> Result<()> {
         if self.stage != Stage::SheriffNominate {
             return Err(anyhow!("当前不是上警阶段"));
         }
         let candidates = self.sheriff_candidates();
-        self.sheriff_original_candidates = candidates.clone();
-        self.sheriff_vote_round = 0;
-        self.sheriff_pk_candidates.clear();
         self.recap_log.push(RecapEvent::SheriffCandidates {
             candidates: candidates.clone(),
         });
@@ -1527,7 +1397,7 @@ impl WolfGame {
             0 => {
                 self.event_log.push("无人上警，本局无警长。".to_string());
                 self.recap_log.push(RecapEvent::SheriffElected { player: None });
-                self.stage = Stage::DayReveal;
+                self.start_day_speech();
             }
             1 => {
                 let only = candidates[0];
@@ -1537,7 +1407,7 @@ impl WolfGame {
                     self.players[only].name
                 ));
                 self.recap_log.push(RecapEvent::SheriffElected { player: Some(only) });
-                self.stage = Stage::DayReveal;
+                self.start_day_speech();
             }
             _ => {
                 // 多候选 → 竞选发言
@@ -1594,7 +1464,7 @@ impl WolfGame {
         self.sheriff_speech_idx >= self.sheriff_speech_order.len()
     }
 
-    /// 首轮发言后进入退水；PK 发言后直接重新投票。
+    /// 上警发言全部说完 → 直接进入警长投票。
     pub fn finish_sheriff_speeches(&mut self) -> Result<()> {
         if self.stage != Stage::SheriffSpeech {
             return Err(anyhow!("当前不是上警发言阶段"));
@@ -1602,81 +1472,11 @@ impl WolfGame {
         if !self.all_sheriff_speeches_done() {
             return Err(anyhow!("还有候选人没发言"));
         }
-        if self.sheriff_vote_round == 0 {
-            self.sheriff_withdrawals.clear();
-            self.stage = Stage::SheriffWithdraw;
-        } else {
-            self.stage = Stage::SheriffVote;
-            self.sheriff_votes.clear();
-            self.sheriff_vote_msgs.clear();
-            self.sheriff_vote_public_msg = None;
-        }
+        self.stage = Stage::SheriffVote;
+        self.sheriff_votes.clear();
+        self.sheriff_vote_msgs.clear();
+        self.sheriff_vote_public_msg = None;
         Ok(())
-    }
-
-    pub fn current_sheriff_withdrawer(&self) -> Option<usize> {
-        self.sheriff_original_candidates
-            .iter()
-            .copied()
-            .find(|idx| !self.sheriff_withdrawals.iter().any(|(done, _)| done == idx))
-    }
-
-    pub fn decide_sheriff_withdraw(&mut self, open_id: &str, stay: bool) -> Result<()> {
-        if self.stage != Stage::SheriffWithdraw {
-            return Err(anyhow!("当前不是退水阶段"));
-        }
-        let idx = self
-            .find_player(open_id)
-            .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if self.current_sheriff_withdrawer() != Some(idx) {
-            return Err(anyhow!("还没轮到你决定退水"));
-        }
-        self.sheriff_withdrawals.push((idx, stay));
-        if !stay {
-            if let Some((_, running)) = self
-                .sheriff_nominations
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == idx)
-            {
-                *running = false;
-            }
-            self.event_log
-                .push(format!("{} 退出警长竞选。", self.players[idx].name));
-        }
-        Ok(())
-    }
-
-    pub fn finish_sheriff_withdraw(&mut self) -> Result<Option<usize>> {
-        if self.stage != Stage::SheriffWithdraw {
-            return Err(anyhow!("当前不是退水阶段"));
-        }
-        if self.current_sheriff_withdrawer().is_some() {
-            return Err(anyhow!("还有候选人未决定是否退水"));
-        }
-        let candidates = self.sheriff_candidates();
-        match candidates.as_slice() {
-            [] => {
-                self.event_log.push("所有候选人退水，本局无警长。".into());
-                self.recap_log.push(RecapEvent::SheriffElected { player: None });
-                self.stage = Stage::DayReveal;
-                Ok(None)
-            }
-            [only] => {
-                self.sheriff_idx = Some(*only);
-                self.event_log
-                    .push(format!("{} 成为唯一候选人，当选警长。", self.players[*only].name));
-                self.recap_log.push(RecapEvent::SheriffElected { player: Some(*only) });
-                self.stage = Stage::DayReveal;
-                Ok(Some(*only))
-            }
-            _ => {
-                self.sheriff_votes.clear();
-                self.sheriff_vote_msgs.clear();
-                self.sheriff_vote_public_msg = None;
-                self.stage = Stage::SheriffVote;
-                Ok(None)
-            }
-        }
     }
 
     // ---- 死亡遗言 ----
@@ -1708,13 +1508,8 @@ impl WolfGame {
             "{} 的遗言：{}",
             self.players[idx].name, display
         ));
-        let night = self
-            .deaths
-            .iter()
-            .rev()
-            .find(|death| death.player_idx == idx && death.day == self.day)
-            .map(|death| death.night)
-            .unwrap_or(false);
+        // 区分夜晚遗言（在 LastWords post=DayReveal 时）vs 放逐遗言（post=DayVote）
+        let night = matches!(self.last_words_post_stage, Some(Stage::DayReveal));
         self.recap_log.push(RecapEvent::LastWords {
             day: self.day,
             night,
@@ -1763,14 +1558,26 @@ impl WolfGame {
         let v_idx = self
             .find_player(voter_open_id)
             .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if !self.sheriff_voters().contains(&v_idx) {
+        if !self.players[v_idx].alive {
+            return Err(anyhow!("死人不能投票"));
+        }
+        // 候选人不能投票
+        if self
+            .sheriff_nominations
+            .iter()
+            .any(|(i, run)| *i == v_idx && *run)
+        {
             return Err(anyhow!("候选人不能参与警长投票"));
         }
         let t_idx = if let Some(t) = target_open_id {
             let idx = self
                 .find_player(t)
                 .ok_or_else(|| anyhow!("目标玩家不存在"))?;
-            if !self.sheriff_candidates().contains(&idx) {
+            if !self
+                .sheriff_nominations
+                .iter()
+                .any(|(i, run)| *i == idx && *run)
+            {
                 return Err(anyhow!("目标不是警长候选人"));
             }
             Some(idx)
@@ -1782,16 +1589,13 @@ impl WolfGame {
     }
 
     pub fn all_sheriff_voters_cast(&self) -> bool {
-        self.sheriff_voters()
+        // 投票人 = 存活的非候选人
+        let candidates = self.sheriff_candidates();
+        let alive: Vec<usize> = self.alive_indices();
+        alive
             .iter()
+            .filter(|i| !candidates.contains(i))
             .all(|i| self.sheriff_votes.for_voter(*i).is_some())
-    }
-
-    pub fn sheriff_voters(&self) -> Vec<usize> {
-        self.sheriff_eligible_indices()
-            .into_iter()
-            .filter(|idx| !self.sheriff_original_candidates.contains(idx))
-            .collect()
     }
 
     pub fn set_sheriff_vote_msg(&mut self, open_id: &str, msg_id: String) {
@@ -1813,15 +1617,11 @@ impl WolfGame {
             .map(|(_, id)| id.as_str())
     }
 
-    /// 解析警长投票。首轮平票进入 PK 发言/复投，第二轮平票才流失警徽。
+    /// 解析警长投票，确定警长人选（平票 = 无警长）。
     pub fn resolve_sheriff_vote(&mut self) -> Result<Option<usize>> {
         if self.stage != Stage::SheriffVote {
             return Err(anyhow!("当前不是警长投票阶段"));
         }
-        self.recap_log.push(RecapEvent::SheriffVoteRound {
-            round: self.sheriff_vote_round + 1,
-            votes: self.sheriff_votes.votes.clone(),
-        });
         let mut tally: Vec<(usize, u32)> = vec![];
         for (_, target) in &self.sheriff_votes.votes {
             if let Some(t) = target {
@@ -1836,7 +1636,7 @@ impl WolfGame {
             self.event_log
                 .push("警长投票全员弃权，本局无警长。".to_string());
             self.recap_log.push(RecapEvent::SheriffElected { player: None });
-            self.stage = Stage::DayReveal;
+            self.start_day_speech();
             return Ok(None);
         }
         let max = tally.iter().map(|(_, c)| *c).max().unwrap_or(0);
@@ -1846,22 +1646,10 @@ impl WolfGame {
             .map(|(i, _)| *i)
             .collect();
         if top.len() > 1 {
-            if self.sheriff_vote_round == 0 {
-                self.sheriff_vote_round = 1;
-                self.sheriff_pk_candidates = top.clone();
-                self.sheriff_speech_order = top;
-                self.sheriff_speech_idx = 0;
-                self.sheriff_speeches.clear();
-                self.sheriff_speech_public_msg = None;
-                self.sheriff_speech_private_msg = None;
-                self.event_log.push("警长投票平票，进入 PK 发言。".into());
-                self.stage = Stage::SheriffSpeech;
-            } else {
-                self.event_log
-                    .push("警长 PK 再次平票，本局无警长。".to_string());
-                self.recap_log.push(RecapEvent::SheriffElected { player: None });
-                self.stage = Stage::DayReveal;
-            }
+            self.event_log
+                .push("警长投票平票，本局无警长。".to_string());
+            self.recap_log.push(RecapEvent::SheriffElected { player: None });
+            self.start_day_speech();
             return Ok(None);
         }
         let elected = top[0];
@@ -1869,7 +1657,7 @@ impl WolfGame {
         self.event_log
             .push(format!("{} 当选警长。", self.players[elected].name));
         self.recap_log.push(RecapEvent::SheriffElected { player: Some(elected) });
-        self.stage = Stage::DayReveal;
+        self.start_day_speech();
         Ok(Some(elected))
     }
 
@@ -1938,15 +1726,7 @@ impl WolfGame {
             Some(Stage::DayReveal) => {
                 self.stage = Stage::DayReveal;
             }
-            Some(Stage::DaySpeech) => {
-                if self.victory().is_some() {
-                    self.stage = Stage::Ended;
-                } else {
-                    self.start_day_speech();
-                }
-            }
             Some(Stage::DayVote) | _ => {
-                self.skip_day_after_reveal = false;
                 self.advance_to_next_night_or_end();
             }
         }
@@ -1992,8 +1772,8 @@ impl WolfGame {
         let v_idx = self
             .find_player(voter_open_id)
             .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if !self.day_voters().contains(&v_idx) {
-            return Err(anyhow!("你不能参与本轮投票"));
+        if !self.players[v_idx].alive {
+            return Err(anyhow!("死人不能投票"));
         }
         let t_idx = if let Some(id) = target_open_id {
             let t = self
@@ -2001,9 +1781,6 @@ impl WolfGame {
                 .ok_or_else(|| anyhow!("目标玩家不存在"))?;
             if !self.players[t].alive {
                 return Err(anyhow!("不能投死人"));
-            }
-            if !self.day_vote_candidates().contains(&t) {
-                return Err(anyhow!("目标不在本轮候选人中"));
             }
             if t == v_idx {
                 return Err(anyhow!("不能投自己"));
@@ -2024,24 +1801,10 @@ impl WolfGame {
     }
 
     pub fn all_alive_voted(&self) -> bool {
-        self.day_voters()
+        let alive: Vec<usize> = self.alive_indices();
+        alive
             .iter()
             .all(|i| self.day_votes.for_voter(*i).is_some())
-    }
-
-    pub fn day_vote_candidates(&self) -> Vec<usize> {
-        if self.day_vote_round == 1 {
-            self.day_pk_candidates.clone()
-        } else {
-            self.alive_indices()
-        }
-    }
-
-    pub fn day_voters(&self) -> Vec<usize> {
-        self.alive_indices()
-            .into_iter()
-            .filter(|idx| self.day_vote_round == 0 || !self.day_pk_candidates.contains(idx))
-            .collect()
     }
 
     /// 计算放逐结果（警长 1.5 倍票权 = 整数 3 vs 普通 2）。
@@ -2049,11 +1812,6 @@ impl WolfGame {
         if self.stage != Stage::DayVote {
             return Err(anyhow!("当前不是投票阶段"));
         }
-        self.recap_log.push(RecapEvent::DayVoteRound {
-            day: self.day,
-            round: self.day_vote_round + 1,
-            votes: self.day_votes.votes.clone(),
-        });
         let mut tally: Vec<(usize, u32)> = vec![];
         for (voter, target) in &self.day_votes.votes {
             if let Some(t) = target {
@@ -2080,22 +1838,9 @@ impl WolfGame {
             .collect();
         if top.len() > 1 {
             self.last_day_lynched = None;
-            if self.day_vote_round == 0 {
-                self.day_vote_round = 1;
-                self.day_pk_candidates = top.clone();
-                self.day_speech_order = top;
-                self.day_speech_idx = 0;
-                self.day_speeches.clear();
-                self.day_speech_public_msg = None;
-                self.day_speech_private_msg = None;
-                self.event_log
-                    .push(format!("第 {} 天：投票平票，进入 PK 发言。", self.day));
-                self.stage = Stage::DaySpeech;
-            } else {
-                self.event_log
-                    .push(format!("第 {} 天：PK 再次平票，无人放逐。", self.day));
-                self.recap_log.push(RecapEvent::DayLynch { day: self.day, target: None });
-            }
+            self.event_log
+                .push(format!("第 {} 天：投票平票，无人放逐。", self.day));
+            self.recap_log.push(RecapEvent::DayLynch { day: self.day, target: None });
             return Ok(None);
         }
         let lynched = top[0];
@@ -2126,9 +1871,6 @@ impl WolfGame {
 
     /// 投票结束后调用：先放逐者遗言 → 猎人/狼王开枪 → 警徽流转，最后下一夜。
     pub fn advance_after_vote(&mut self) -> Result<()> {
-        if self.stage == Stage::DaySpeech && self.day_vote_round == 1 {
-            return Ok(());
-        }
         if let Some(lynched) = self.last_day_lynched {
             // 准备 pending 技能（不立即切阶段）
             let role = self.players[lynched].role;
@@ -2152,63 +1894,6 @@ impl WolfGame {
         }
         self.advance_to_next_night_or_end();
         Ok(())
-    }
-
-    /// 狼人在白天自爆。竞选阶段自爆吞警徽；其他白天阶段立即结束当天。
-    pub fn self_explode(&mut self, wolf_open_id: &str) -> Result<usize> {
-        let during_election = matches!(
-            self.stage,
-            Stage::SheriffNominate
-                | Stage::SheriffSpeech
-                | Stage::SheriffWithdraw
-                | Stage::SheriffVote
-        );
-        if !during_election
-            && !matches!(
-                self.stage,
-                Stage::SheriffPickDirection | Stage::DaySpeech | Stage::DayVote
-            )
-        {
-            return Err(anyhow!("当前不能自爆"));
-        }
-        let idx = self
-            .find_player(wolf_open_id)
-            .ok_or_else(|| anyhow!("你不在桌上"))?;
-        if !self.is_wolf(idx) || !self.players[idx].alive {
-            return Err(anyhow!("你不是存活的狼人"));
-        }
-
-        self.players[idx].alive = false;
-        self.deaths.push(DeathEvent {
-            day: self.day,
-            night: false,
-            player_idx: idx,
-            cause: DeathCause::SelfExplode,
-        });
-        self.recap_log.push(RecapEvent::Death {
-            day: self.day,
-            night: false,
-            player: idx,
-            cause: DeathCause::SelfExplode,
-        });
-        self.event_log
-            .push(format!("第 {} 天：{} 自爆。", self.day, self.players[idx].name));
-
-        if during_election {
-            self.sheriff_enabled = false;
-            self.sheriff_idx = None;
-            self.sheriff_votes.clear();
-            self.sheriff_pk_candidates.clear();
-            self.skip_day_after_reveal = true;
-            self.stage = Stage::DayReveal;
-        } else if Some(idx) == self.sheriff_idx {
-            self.pending_badge = Some(idx);
-            self.pending_badge_post_stage = Some(Stage::DayVote);
-            self.stage = Stage::BadgePass;
-        } else {
-            self.advance_to_next_night_or_end();
-        }
-        Ok(idx)
     }
 
     /// 猎人开枪：target 可为 None（不开枪）。
@@ -2330,39 +2015,38 @@ impl WolfGame {
         self.day_speech_public_msg = None;
         self.day_speech_private_msg = None;
         self.day_votes.clear();
-        self.day_vote_round = 0;
-        self.day_pk_candidates.clear();
-        self.skip_day_after_reveal = false;
         self.event_log
             .push(format!("第 {} 夜开始。", self.day));
     }
 
     /// 胜负检查。
     ///
-    /// 屠边规则：全部狼人死亡则好人胜；村民或神职任一边归零则狼人胜。
+    /// **屠城规则 + 警长例外**：
+    /// - 全部狼死 → 好人胜
+    /// - 狼数 > 好人数 → 狼胜（绝对多数）
+    /// - 狼数 == 好人数：
+    ///   - 警长存活且是好人 → 不算狼胜（1.5x 票权能压回，游戏继续）
+    ///   - 否则 → 狼胜
     pub fn victory(&self) -> Option<Winner> {
         let wolves = self.alive_wolf_count();
+        let good = self.alive_good_count();
         if wolves == 0 {
             return Some(Winner::Good);
         }
-        let villagers = self
-            .players
-            .iter()
-            .filter(|player| player.alive && player.role == Some(Role::Villager))
-            .count();
-        let gods = self
-            .players
-            .iter()
-            .filter(|player| {
-                player.alive
-                    && player
-                        .role
-                        .map(|role| !role.is_wolf() && role != Role::Villager)
-                        .unwrap_or(false)
-            })
-            .count();
-        if villagers == 0 || gods == 0 {
+        if wolves > good {
             return Some(Winner::Wolves);
+        }
+        if wolves == good {
+            // 警长还在好人手上 → 1.5x 票权使好人在投票中占优
+            // 例如 1:1 时好人警长（3 权）vs 狼（2 权）→ 狼会被投出
+            let sheriff_protects = self
+                .sheriff_idx
+                .filter(|s| self.players[*s].alive)
+                .map(|s| !self.is_wolf(s))
+                .unwrap_or(false);
+            if !sheriff_protects {
+                return Some(Winner::Wolves);
+            }
         }
         None
     }
@@ -2395,26 +2079,12 @@ mod tests {
         g.players[8].role = Some(Role::Villager);
     }
 
-    /// 10 人板锁定：P0/1 狼，P2 狼王，P3 预言家，P4 女巫，P5 猎人，P6 守卫，P7-9 村民。
-    fn lock_roles_10(g: &mut WolfGame) {
-        g.players[0].role = Some(Role::Werewolf);
-        g.players[1].role = Some(Role::Werewolf);
-        g.players[2].role = Some(Role::WolfKing);
-        g.players[3].role = Some(Role::Seer);
-        g.players[4].role = Some(Role::Witch);
-        g.players[5].role = Some(Role::Hunter);
-        g.players[6].role = Some(Role::Guard);
-        g.players[7].role = Some(Role::Villager);
-        g.players[8].role = Some(Role::Villager);
-        g.players[9].role = Some(Role::Villager);
-    }
-
-    /// 12 人板锁定：P0-2 狼，P3 狼王，P4 预言家，P5 女巫，P6 猎人，P7 守卫，P8-11 村民。
+    /// 12 人板锁定：P0-3 狼，P4 预言家，P5 女巫，P6 猎人，P7 守卫，P8-11 村民。
     fn lock_roles_12(g: &mut WolfGame) {
         g.players[0].role = Some(Role::Werewolf);
         g.players[1].role = Some(Role::Werewolf);
         g.players[2].role = Some(Role::Werewolf);
-        g.players[3].role = Some(Role::WolfKing);
+        g.players[3].role = Some(Role::Werewolf);
         g.players[4].role = Some(Role::Seer);
         g.players[5].role = Some(Role::Witch);
         g.players[6].role = Some(Role::Hunter);
@@ -2509,39 +2179,6 @@ mod tests {
         assert!(Role::WolfKing.is_wolf());
         assert!(Role::Werewolf.is_wolf());
         assert!(!Role::Seer.is_wolf());
-
-        let mut game = make_n(10);
-        game.players[0].role = Some(Role::WolfKing);
-        assert!(game.is_wolf(0));
-    }
-
-    #[test]
-    fn wolfking_can_use_wolf_actions_and_is_checked_as_wolf() {
-        let mut game = make_n(10);
-        game.players[0].role = Some(Role::WolfKing);
-        game.players[1].role = Some(Role::Werewolf);
-        game.players[2].role = Some(Role::Werewolf);
-        game.players[3].role = Some(Role::Seer);
-        game.stage = Stage::WolvesPick;
-
-        game.wolf_pick("p0", "p7").unwrap();
-        game.wolf_say("p0", "统一刀 7".into()).unwrap();
-        game.wolf_mark_ready("p0").unwrap();
-        assert!(game.is_wolf_ready(0));
-
-        game.stage = Stage::SeerPick;
-        assert!(game.seer_check("p3", "p0").unwrap());
-    }
-
-    #[test]
-    fn wolves_disagreeing_produces_an_empty_kill() {
-        let mut game = make_n(9);
-        lock_roles_9(&mut game);
-        game.wolf_pick("p0", "p6").unwrap();
-        game.wolf_pick("p1", "p7").unwrap();
-        game.wolf_pick("p2", "p6").unwrap();
-        game.advance_after_wolves().unwrap();
-        assert_eq!(game.night_victim, None);
     }
 
     #[test]
@@ -2576,7 +2213,8 @@ mod tests {
     }
 
     #[test]
-    fn night_deaths_after_first_night_have_no_last_words() {
+    fn night_deaths_have_no_last_words() {
+        // 夜里死的人（无论狼刀还是毒杀）都不发表遗言。
         let mut g = make_n(9);
         lock_roles_9(&mut g);
         // 狼空刀（投自己人也行，简化用同一个目标但跳过狼刀）
@@ -2585,9 +2223,11 @@ mod tests {
         g.wolf_pick("p2", "p8").unwrap();
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p0").unwrap();
-        // 首夜救人，第二夜再制造夜间死亡。
+        // 女巫救 P8（防狼刀）+ 不可同时毒。所以分两次测：
+        // 这里只能用毒或救其中之一。让女巫不救 → P8 死于狼刀（有遗言）
+        // 然后下一夜女巫再毒人 → 那时被毒者无遗言
         g.witch_act("p4", true, None).unwrap();
-        // P8 被救，首夜无人死亡。
+        // P8 被救，没死 → 没有 last_words
         assert_eq!(g.stage, Stage::DayReveal);
         assert!(g.last_night_deaths.is_empty());
 
@@ -2717,127 +2357,8 @@ mod tests {
         assert!(g.all_sheriff_speeches_done());
 
         g.finish_sheriff_speeches().unwrap();
-        assert_eq!(g.stage, Stage::SheriffWithdraw);
-        g.decide_sheriff_withdraw("p0", true).unwrap();
-        g.decide_sheriff_withdraw("p3", true).unwrap();
-        g.finish_sheriff_withdraw().unwrap();
+        // 候选人发完 → 直接进警长投票（没有警下发言环节）
         assert_eq!(g.stage, Stage::SheriffVote);
-    }
-
-    #[test]
-    fn first_night_dead_player_can_join_and_vote_in_sheriff_election() {
-        let mut g = make_n(10);
-        g.day = 1;
-        g.stage = Stage::SheriffNominate;
-        g.players[9].alive = false;
-        g.last_night_deaths = vec![9];
-
-        assert!(g.sheriff_eligible_indices().contains(&9));
-        for i in 0..10 {
-            g.nominate_sheriff(&format!("p{i}"), i == 0 || i == 3)
-                .unwrap();
-        }
-        g.finish_sheriff_nominate().unwrap();
-        g.submit_sheriff_speech("p0", "竞选".into()).unwrap();
-        g.submit_sheriff_speech("p3", "竞选".into()).unwrap();
-        g.finish_sheriff_speeches().unwrap();
-        g.decide_sheriff_withdraw("p0", true).unwrap();
-        g.decide_sheriff_withdraw("p3", true).unwrap();
-        g.finish_sheriff_withdraw().unwrap();
-
-        assert!(g.sheriff_voters().contains(&9));
-        g.cast_sheriff_vote("p9", Some("p0")).unwrap();
-    }
-
-    #[test]
-    fn withdrawn_candidate_cannot_vote_for_sheriff() {
-        let mut g = make_n(10);
-        g.stage = Stage::SheriffNominate;
-        for i in 0..10 {
-            g.nominate_sheriff(&format!("p{i}"), matches!(i, 0 | 3 | 4))
-                .unwrap();
-        }
-        g.finish_sheriff_nominate().unwrap();
-        for idx in [0, 3, 4] {
-            g.submit_sheriff_speech(&format!("p{idx}"), "竞选".into())
-                .unwrap();
-        }
-        g.finish_sheriff_speeches().unwrap();
-        g.decide_sheriff_withdraw("p0", false).unwrap();
-        g.decide_sheriff_withdraw("p3", true).unwrap();
-        g.decide_sheriff_withdraw("p4", true).unwrap();
-        g.finish_sheriff_withdraw().unwrap();
-
-        assert_eq!(g.sheriff_candidates(), vec![3, 4]);
-        assert!(!g.sheriff_voters().contains(&0));
-        assert!(g.cast_sheriff_vote("p0", Some("p3")).is_err());
-    }
-
-    #[test]
-    fn sheriff_tie_enters_pk_and_revote_can_elect() {
-        let mut g = make_n(10);
-        g.stage = Stage::SheriffVote;
-        g.sheriff_nominations = vec![(0, true), (3, true)];
-        g.sheriff_original_candidates = vec![0, 3];
-        for voter in [1, 2, 4, 5] {
-            g.cast_sheriff_vote(&format!("p{voter}"), Some("p0"))
-                .unwrap();
-        }
-        for voter in [6, 7, 8, 9] {
-            g.cast_sheriff_vote(&format!("p{voter}"), Some("p3"))
-                .unwrap();
-        }
-
-        assert_eq!(g.resolve_sheriff_vote().unwrap(), None);
-        assert_eq!(g.stage, Stage::SheriffSpeech);
-        assert_eq!(g.sheriff_vote_round, 1);
-        for candidate in [0, 3] {
-            g.submit_sheriff_speech(&format!("p{candidate}"), "PK".into())
-                .unwrap();
-        }
-        g.finish_sheriff_speeches().unwrap();
-        for voter in [1, 2, 4, 5, 6] {
-            g.cast_sheriff_vote(&format!("p{voter}"), Some("p0"))
-                .unwrap();
-        }
-        for voter in [7, 8, 9] {
-            g.cast_sheriff_vote(&format!("p{voter}"), Some("p3"))
-                .unwrap();
-        }
-
-        assert_eq!(g.resolve_sheriff_vote().unwrap(), Some(0));
-        assert_eq!(g.sheriff_idx, Some(0));
-        assert_eq!(g.stage, Stage::DayReveal);
-    }
-
-    #[test]
-    fn sheriff_second_tie_loses_the_badge() {
-        let mut g = make_n(10);
-        g.stage = Stage::SheriffVote;
-        g.sheriff_nominations = vec![(0, true), (3, true)];
-        g.sheriff_original_candidates = vec![0, 3];
-
-        for _round in 0..2 {
-            for voter in [1, 2, 4, 5] {
-                g.cast_sheriff_vote(&format!("p{voter}"), Some("p0"))
-                    .unwrap();
-            }
-            for voter in [6, 7, 8, 9] {
-                g.cast_sheriff_vote(&format!("p{voter}"), Some("p3"))
-                    .unwrap();
-            }
-            assert_eq!(g.resolve_sheriff_vote().unwrap(), None);
-            if g.sheriff_vote_round == 1 && g.stage == Stage::SheriffSpeech {
-                for candidate in [0, 3] {
-                    g.submit_sheriff_speech(&format!("p{candidate}"), "PK".into())
-                        .unwrap();
-                }
-                g.finish_sheriff_speeches().unwrap();
-            }
-        }
-
-        assert_eq!(g.sheriff_idx, None);
-        assert_eq!(g.stage, Stage::DayReveal);
     }
 
     #[test]
@@ -2897,14 +2418,12 @@ mod tests {
         assert_eq!(g.stage, Stage::WitchAct);
 
         g.witch_act("p4", false, None).unwrap();
-        // 首夜先公布死讯，再进入死亡玩家遗言。
+        // 夜里死的人不说遗言，直接 DayReveal
         assert_eq!(g.stage, Stage::DayReveal);
         assert_eq!(g.last_night_deaths, vec![8]);
 
+        // 9 人不上警 → 直接进发言（无警长 → 直接 DaySpeech）
         g.enter_day_discuss().unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p8", "首夜遗言".into()).unwrap();
-        g.finish_last_words().unwrap();
         assert_eq!(g.stage, Stage::DaySpeech);
         while !g.all_day_speeches_done() {
             let speaker_idx = g.current_day_speaker().unwrap();
@@ -2962,17 +2481,14 @@ mod tests {
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p0").unwrap();
         g.witch_act("p4", false, None).unwrap();
-        assert_eq!(g.stage, Stage::DayReveal);
-        g.enter_day_discuss().unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p5", "猎人遗言".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // 夜里死的人不说遗言；猎人直接进 HunterShoot 阶段
+        // （由 dying_hunter_combined 一次性吐出『一句话+开枪目标』）
         assert_eq!(g.stage, Stage::HunterShoot);
 
         let shot = g.hunter_shoot("p5", Some("p0")).unwrap();
         assert_eq!(shot, Some(0));
         assert!(!g.players[0].alive);
-        assert_eq!(g.stage, Stage::DaySpeech);
+        assert_eq!(g.stage, Stage::DayReveal);
     }
 
     #[test]
@@ -2993,7 +2509,6 @@ mod tests {
     fn guard_blocks_wolf_kill() {
         let mut g = make_n(12);
         lock_roles_12(&mut g);
-        g.sheriff_enabled = false;
         // P7 是守卫，守 P8 (村民)
         g.guard_pick("p7", "p8").unwrap();
         assert_eq!(g.stage, Stage::WolvesPick);
@@ -3002,7 +2517,6 @@ mod tests {
         g.wolf_pick("p0", "p8").unwrap();
         g.wolf_pick("p1", "p8").unwrap();
         g.wolf_pick("p2", "p8").unwrap();
-        g.wolf_pick("p3", "p8").unwrap();
         g.advance_after_wolves().unwrap();
         g.seer_check("p4", "p0").unwrap();
         g.witch_act("p5", false, None).unwrap();
@@ -3016,16 +2530,14 @@ mod tests {
         // 同守同救：守卫守 P8 + 女巫救 P8 = P8 依然死亡
         let mut g = make_n(12);
         lock_roles_12(&mut g);
-        g.sheriff_enabled = false;
         g.guard_pick("p7", "p8").unwrap();
         g.wolf_pick("p0", "p8").unwrap();
         g.wolf_pick("p1", "p8").unwrap();
         g.wolf_pick("p2", "p8").unwrap();
-        g.wolf_pick("p3", "p8").unwrap();
         g.advance_after_wolves().unwrap();
         g.seer_check("p4", "p0").unwrap();
         g.witch_act("p5", true, None).unwrap();
-        // P8 首夜死亡，先进入 DayReveal，之后再处理遗言。
+        // 死了 P8 → 夜里不说遗言，直接 DayReveal
         assert_eq!(g.stage, Stage::DayReveal);
         assert_eq!(g.last_night_deaths, vec![8], "同守同救应当死亡");
     }
@@ -3034,13 +2546,11 @@ mod tests {
     fn guard_cannot_repeat_target() {
         let mut g = make_n(12);
         lock_roles_12(&mut g);
-        g.sheriff_enabled = false;
         g.guard_pick("p7", "p8").unwrap();
         // 跑完一夜进第二夜
         g.wolf_pick("p0", "p8").unwrap();
         g.wolf_pick("p1", "p8").unwrap();
         g.wolf_pick("p2", "p8").unwrap();
-        g.wolf_pick("p3", "p8").unwrap();
         g.advance_after_wolves().unwrap();
         g.seer_check("p4", "p0").unwrap();
         g.witch_act("p5", false, None).unwrap();
@@ -3084,29 +2594,12 @@ mod tests {
     }
 
     #[test]
-    fn guard_skip_breaks_consecutive_protection() {
-        let mut g = make_n(12);
-        lock_roles_12(&mut g);
-        g.guard_pick("p7", "p8").unwrap();
-        assert_eq!(g.last_guard_target, Some(8));
-
-        g.stage = Stage::GuardPick;
-        g.guard_skip("p7").unwrap();
-        assert_eq!(g.guard_target, None);
-        assert_eq!(g.last_guard_target, None);
-
-        g.stage = Stage::GuardPick;
-        g.guard_pick("p7", "p8").unwrap();
-        assert_eq!(g.last_guard_target, Some(8));
-    }
-
-    #[test]
     fn sheriff_election_single_candidate_auto_elected() {
         let mut g = make_n(10);
         // 10 人板：3 狼 + 预女猎守 + 3 民。开局先经历 GuardPick (默认守自己) → 狼 → 预 → 女
         g.players[0].role = Some(Role::Werewolf);
         g.players[1].role = Some(Role::Werewolf);
-        g.players[2].role = Some(Role::WolfKing);
+        g.players[2].role = Some(Role::Werewolf);
         g.players[3].role = Some(Role::Seer);
         g.players[4].role = Some(Role::Witch);
         g.players[5].role = Some(Role::Hunter);
@@ -3122,12 +2615,16 @@ mod tests {
         g.advance_after_wolves().unwrap();
         g.seer_check("p3", "p0").unwrap();
         g.witch_act("p4", false, None).unwrap();
-        // 首夜先竞选警长，再公布死讯。
+        // P9 死于狼刀，夜里不说遗言，直接进 DayReveal
+        assert_eq!(g.stage, Stage::DayReveal);
+
+        // 进入上警阶段
+        g.enter_day_discuss().unwrap();
         assert_eq!(g.stage, Stage::SheriffNominate);
 
         // 全员决定：只有 P3 上警
         for id in g
-            .sheriff_eligible_indices()
+            .alive_indices()
             .iter()
             .map(|i| g.players[*i].open_id.clone())
             .collect::<Vec<_>>()
@@ -3136,13 +2633,8 @@ mod tests {
             g.nominate_sheriff(&id, run).unwrap();
         }
         g.finish_sheriff_nominate().unwrap();
-        // 唯一候选自动当选，但必须先公布死讯并处理首夜遗言。
+        // 唯一候选 → 自动当选 → 让警长选方向
         assert_eq!(g.sheriff_idx, Some(3));
-        assert_eq!(g.stage, Stage::DayReveal);
-        g.enter_day_discuss().unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p9", "首夜遗言".into()).unwrap();
-        g.finish_last_words().unwrap();
         assert_eq!(g.stage, Stage::SheriffPickDirection);
     }
 
@@ -3151,7 +2643,7 @@ mod tests {
         let mut g = make_n(10);
         g.players[0].role = Some(Role::Werewolf);
         g.players[1].role = Some(Role::Werewolf);
-        g.players[2].role = Some(Role::WolfKing);
+        g.players[2].role = Some(Role::Werewolf);
         g.players[3].role = Some(Role::Seer);
         g.players[4].role = Some(Role::Witch);
         g.players[5].role = Some(Role::Hunter);
@@ -3186,89 +2678,11 @@ mod tests {
     }
 
     #[test]
-    fn day_vote_tie_enters_pk_and_only_off_stage_players_revote() {
-        let mut g = make_n(9);
-        lock_roles_9(&mut g);
-        g.stage = Stage::DayVote;
-
-        for voter in [0, 2, 3, 4] {
-            g.cast_vote(&format!("p{voter}"), Some("p1")).unwrap();
-        }
-        for voter in [1, 5, 6, 7] {
-            g.cast_vote(&format!("p{voter}"), Some("p0")).unwrap();
-        }
-        g.cast_vote("p8", None).unwrap();
-
-        assert_eq!(g.resolve_lynch().unwrap(), None);
-        assert_eq!(g.stage, Stage::DaySpeech);
-        assert_eq!(g.day_vote_round, 1);
-        assert_eq!(g.day_pk_candidates.len(), 2);
-        while let Some(candidate) = g.current_day_speaker() {
-            let open_id = g.players[candidate].open_id.clone();
-            g.submit_day_speech(&open_id, "PK".into()).unwrap();
-        }
-        g.enter_day_vote().unwrap();
-
-        assert!(g.cast_vote("p0", Some("p1")).is_err());
-        assert!(g.cast_vote("p2", Some("p3")).is_err());
-        for voter in [2, 3, 4, 5] {
-            g.cast_vote(&format!("p{voter}"), Some("p0")).unwrap();
-        }
-        for voter in [6, 7, 8] {
-            g.cast_vote(&format!("p{voter}"), Some("p1")).unwrap();
-        }
-        assert_eq!(g.resolve_lynch().unwrap(), Some(0));
-    }
-
-    #[test]
-    fn self_explode_ends_the_day_without_revealing_other_roles() {
-        let mut g = make_n(9);
-        lock_roles_9(&mut g);
-        g.stage = Stage::DaySpeech;
-
-        assert_eq!(g.self_explode("p0").unwrap(), 0);
-        assert!(!g.players[0].alive);
-        assert!(matches!(
-            g.deaths.last(),
-            Some(DeathEvent {
-                player_idx: 0,
-                cause: DeathCause::SelfExplode,
-                ..
-            })
-        ));
-        assert_eq!(g.day, 2);
-        assert_eq!(g.stage, Stage::WolvesPick);
-    }
-
-    #[test]
-    fn election_self_explode_cancels_badge_and_skips_the_day_after_reveal() {
-        let mut g = make_n(10);
-        lock_roles_10(&mut g);
-        g.players[9].alive = false;
-        g.last_night_deaths = vec![9];
-        g.last_words_queue = vec![9];
-        g.stage = Stage::SheriffSpeech;
-
-        g.self_explode("p0").unwrap();
-        assert_eq!(g.stage, Stage::DayReveal);
-        assert!(g.skip_day_after_reveal);
-        assert_eq!(g.sheriff_idx, None);
-        g.enter_day_discuss().unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p9", "遗言".into()).unwrap();
-        g.finish_last_words().unwrap();
-
-        assert_eq!(g.day, 2);
-        assert_eq!(g.stage, Stage::GuardPick);
-        assert!(!g.sheriff_enabled);
-    }
-
-    #[test]
     fn sheriff_dies_triggers_badge_pass() {
         let mut g = make_n(10);
         g.players[0].role = Some(Role::Werewolf);
         g.players[1].role = Some(Role::Werewolf);
-        g.players[2].role = Some(Role::WolfKing);
+        g.players[2].role = Some(Role::Werewolf);
         g.players[3].role = Some(Role::Seer);
         g.players[4].role = Some(Role::Witch);
         g.players[5].role = Some(Role::Hunter);
@@ -3284,24 +2698,21 @@ mod tests {
         g.wolf_pick("p1", "p3").unwrap();
         g.wolf_pick("p2", "p3").unwrap();
         g.advance_after_wolves().unwrap();
-        // 夜间死亡在女巫行动后统一结算；这里直接进入女巫阶段，聚焦测试警徽流转。
+        // 警长（P3 预言家）已死，不能再查验。这里手动跳过
+        // 实际 advance_after_wolves 会进 SeerPick，但 P3 已死 → 直接到 WitchAct
+        // 简化：手动测警徽流转
         g.stage = Stage::WitchAct;
         g.night_victim = Some(3);
         g.witch_act("p4", false, None).unwrap();
-        // 首夜先公布死讯，死者说完遗言后再处理警徽。
-        assert_eq!(g.stage, Stage::DayReveal);
-        assert_eq!(g.pending_badge, Some(3));
-        g.enter_day_discuss().unwrap();
-        assert_eq!(g.stage, Stage::LastWords);
-        g.submit_last_words("p3", "警徽撕掉".into()).unwrap();
-        g.finish_last_words().unwrap();
+        // 警长死于夜里，不说遗言；pending_badge 走 BadgePass
         assert_eq!(g.stage, Stage::BadgePass);
+        assert_eq!(g.pending_badge, Some(3));
 
         // 撕毁警徽
         let new_holder = g.transfer_badge("p3", None).unwrap();
         assert_eq!(new_holder, None);
         assert_eq!(g.sheriff_idx, None);
-        assert_eq!(g.stage, Stage::DaySpeech);
+        assert_eq!(g.stage, Stage::DayReveal);
     }
 
     #[test]
@@ -3315,38 +2726,79 @@ mod tests {
     }
 
     #[test]
-    fn victory_when_all_gods_are_dead() {
+    fn victory_when_wolves_outnumber() {
+        // 2 狼 vs 1 好人 (绝对多数) → 狼胜，无关警长
         let mut g = make_n(9);
         lock_roles_9(&mut g);
-        for i in 3..=5 {
+        g.players[2].alive = false;
+        for i in 3..=7 {
             g.players[i].alive = false;
         }
+        assert_eq!(g.alive_wolf_count(), 2);
+        assert_eq!(g.alive_good_count(), 1);
         assert_eq!(g.victory(), Some(Winner::Wolves));
     }
 
     #[test]
-    fn victory_when_all_villagers_are_dead() {
+    fn victory_at_parity_no_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，无警长 → 狼胜（屠城，1.5x 不存在）
         let mut g = make_n(9);
         lock_roles_9(&mut g);
-        for i in 6..=8 {
+        // 杀掉 P1 P2（其他 2 狼）+ P3-7（5 个好人），剩 P0 狼 + P8 好人
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
             g.players[i].alive = false;
         }
+        assert_eq!(g.alive_wolf_count(), 1);
+        assert_eq!(g.alive_good_count(), 1);
+        assert!(g.sheriff_idx.is_none());
         assert_eq!(g.victory(), Some(Winner::Wolves));
     }
 
     #[test]
-    fn victory_does_not_depend_on_parity_or_sheriff() {
+    fn victory_at_parity_with_good_sheriff_continues() {
+        // 1 狼 vs 1 好人，警长是好人 → 不算狼胜（1.5x 票权能压回）
         let mut g = make_n(9);
         lock_roles_9(&mut g);
         g.players[1].alive = false;
         g.players[2].alive = false;
-        g.players[4].alive = false;
-        g.players[5].alive = false;
-        g.players[7].alive = false;
-        g.players[8].alive = false;
-        g.sheriff_idx = Some(3);
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        // P8 (好人村民) 是警长
+        g.sheriff_idx = Some(8);
         assert_eq!(g.alive_wolf_count(), 1);
-        assert_eq!(g.alive_count(), 3);
-        assert_eq!(g.victory(), None, "民和神均未被屠，不应按人数判狼胜");
+        assert_eq!(g.alive_good_count(), 1);
+        assert_eq!(g.victory(), None, "好人警长在场时 1:1 不算狼胜");
+    }
+
+    #[test]
+    fn victory_at_parity_with_dead_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，警长已死 → 狼胜
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        // P3 曾是警长，但已死
+        g.sheriff_idx = Some(3);
+        assert_eq!(g.victory(), Some(Winner::Wolves));
+    }
+
+    #[test]
+    fn victory_at_parity_with_wolf_sheriff_wolves_win() {
+        // 1 狼 vs 1 好人，警长在狼身上 → 狼胜（狼也享受 1.5x，更乱）
+        let mut g = make_n(9);
+        lock_roles_9(&mut g);
+        g.players[1].alive = false;
+        g.players[2].alive = false;
+        for i in 3..=7 {
+            g.players[i].alive = false;
+        }
+        g.sheriff_idx = Some(0); // P0 是狼且是警长
+        assert_eq!(g.victory(), Some(Winner::Wolves));
     }
 }
