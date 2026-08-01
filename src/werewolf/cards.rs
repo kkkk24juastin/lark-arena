@@ -45,6 +45,21 @@ fn merge(a: &Value, b: &Value) -> Value {
     out
 }
 
+fn self_explode_action(game: &WolfGame, viewer: &Player) -> Option<Value> {
+    viewer.role.filter(|role| role.is_wolf()).map(|_| {
+        actions(vec![button(
+            "💥 自爆",
+            json!({
+                "chat_id": game.chat_id,
+                "game": game.game_count,
+                "actor": viewer.open_id,
+                "action": "wolf_self_explode",
+            }),
+            "danger_filled",
+        )])
+    })
+}
+
 /// 玩家选择按钮组。每个候选玩家一颗按钮。
 fn target_buttons(
     chat_id: &str,
@@ -116,6 +131,9 @@ pub fn build_role_reveal_card(game: &WolfGame, viewer: &Player) -> Value {
         } else {
             elements.push(markdown("🐺 你是独狼。"));
         }
+        if let Some(explode) = self_explode_action(game, viewer) {
+            elements.push(explode);
+        }
     }
 
     elements.push(note(
@@ -142,7 +160,7 @@ pub fn build_game_start_card(game: &WolfGame) -> Value {
         .iter()
         .map(|p| display_name(p))
         .collect();
-    // 板娘信息：人数 → 角色配比
+    // 板型信息：人数 → 角色配比
     let n = game.players.len();
     let dist_label = match n {
         9 => "3 狼 / 预 / 女 / 猎 / 3 民（不上警）",
@@ -159,7 +177,7 @@ pub fn build_game_start_card(game: &WolfGame) -> Value {
         ),
         vec![
             markdown(&format!("**入夜玩家：**\n{}", names.join(" · "))),
-            note("身份已通过私密卡发给每位玩家。屠城规则：狼数 ≥ 好人数 即狼胜。"),
+            note("身份已通过私密卡发给每位玩家。暗牌屠边：屠民或屠神即狼胜。"),
         ],
     )
 }
@@ -176,7 +194,14 @@ pub fn build_night_progress_card(game: &WolfGame) -> Value {
         ("药剂环节", Stage::WitchAct),
     ]);
     let current = steps.iter().position(|(_, stage)| *stage == game.stage);
-    let all_processed = game.stage == Stage::DayReveal
+    let all_processed = matches!(
+        game.stage,
+        Stage::SheriffNominate
+            | Stage::SheriffSpeech
+            | Stage::SheriffWithdraw
+            | Stage::SheriffVote
+            | Stage::DayReveal
+    )
         || (game.stage == Stage::LastWords
             && game.last_words_post_stage == Some(Stage::DayReveal));
     let processed = if all_processed {
@@ -267,6 +292,16 @@ pub fn build_guard_night_card(game: &WolfGame, viewer: &Player) -> Value {
         "primary",
     );
     elements.extend(button_grid(buttons, 3));
+    elements.push(actions(vec![button(
+        "空守",
+        json!({
+            "chat_id": game.chat_id,
+            "game": game.game_count,
+            "actor": viewer.open_id,
+            "action": "wolf_guard_skip",
+        }),
+        "default",
+    )]));
     elements.push(note("仅你可见 · 同守同救会导致目标依然死亡"));
     card(
         header_with_subtitle(
@@ -655,27 +690,31 @@ pub fn build_sheriff_nominate_card(game: &WolfGame, viewer: &Player) -> Value {
             "default",
         ),
     ];
+    let mut elements = vec![
+        markdown(
+            "**第 1 天上警**：你可以选择参选警长。警长有 1.5 倍票权，死亡时可移交警徽。\n\
+             候选人不能投票，由其他玩家投出。",
+        ),
+        actions(buttons),
+    ];
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
+    elements.push(note("仅你可见"));
     card(
         header_with_subtitle(
             "🎖️ 上警阶段",
             "决定是否参选警长",
             "yellow",
         ),
-        vec![
-            markdown(
-                "**第 1 天上警**：你可以选择参选警长。警长有 1.5 倍票权，死亡时可移交警徽。\n\
-                 候选人不能投票，由其他玩家投出。",
-            ),
-            actions(buttons),
-            note("仅你可见"),
-        ],
+        elements,
     )
 }
 
 /// 上警选择公开进度。只展示是否完成选择，不提前公开是否参选。
 pub fn build_sheriff_nominate_progress_card(game: &WolfGame) -> Value {
-    let alive = game.alive_indices();
-    let decided = alive
+    let eligible = game.sheriff_eligible_indices();
+    let decided = eligible
         .iter()
         .filter(|i| {
             game.sheriff_nominations
@@ -683,7 +722,7 @@ pub fn build_sheriff_nominate_progress_card(game: &WolfGame) -> Value {
                 .any(|(player, _)| player == *i)
         })
         .count();
-    let lines: Vec<String> = alive
+    let lines: Vec<String> = eligible
         .iter()
         .map(|i| {
             let status = if game
@@ -702,7 +741,7 @@ pub fn build_sheriff_nominate_progress_card(game: &WolfGame) -> Value {
     card(
         header_with_subtitle(
             "🎖️ 上警选择进度",
-            &format!("{decided}/{} 已完成", alive.len()),
+            &format!("{decided}/{} 已完成", eligible.len()),
             "yellow",
         ),
         vec![
@@ -750,6 +789,34 @@ pub fn build_sheriff_candidates_card(game: &WolfGame) -> Value {
     )
 }
 
+pub fn build_sheriff_withdraw_card(game: &WolfGame, viewer: &Player) -> Value {
+    let base = json!({
+        "chat_id": game.chat_id,
+        "game": game.game_count,
+        "actor": viewer.open_id,
+    });
+    let mut elements = vec![
+        markdown("竞选发言结束，请决定留在警上或退水。退水后不能参与本次警长投票。"),
+        actions(vec![
+            button(
+                "继续竞选",
+                merge(&base, &json!({ "action": "wolf_sheriff_stay" })),
+                "primary_filled",
+            ),
+            button(
+                "退水",
+                merge(&base, &json!({ "action": "wolf_sheriff_withdraw" })),
+                "default",
+            ),
+        ]),
+    ];
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
+    elements.push(note("仅你可见"));
+    card(header("🎖️ 退水决定", "yellow"), elements)
+}
+
 pub fn build_sheriff_vote_card(game: &WolfGame, viewer: &Player) -> Value {
     let candidates: Vec<(usize, &Player)> = game
         .sheriff_candidates()
@@ -778,6 +845,9 @@ pub fn build_sheriff_vote_card(game: &WolfGame, viewer: &Player) -> Value {
         "action": "wolf_sheriff_vote_abstain",
     });
     elements.push(actions(vec![button("弃权", v_abs, "default")]));
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
     elements.push(note("仅你可见 · 候选人本人不能投票"));
     card(
         header("🎖️ 警长投票", "yellow"),
@@ -788,21 +858,27 @@ pub fn build_sheriff_vote_card(game: &WolfGame, viewer: &Player) -> Value {
 /// 警长投票的公开进度。只展示是否完成，不泄露投票目标或是否弃权。
 pub fn build_sheriff_vote_progress_card(game: &WolfGame) -> Value {
     let candidates = game.sheriff_candidates();
-    let voters: Vec<usize> = game
-        .alive_indices()
-        .into_iter()
-        .filter(|i| !candidates.contains(i))
-        .collect();
+    let voters = game.sheriff_voters();
     let voted = voters
         .iter()
         .filter(|i| game.sheriff_votes.for_voter(**i).is_some())
         .count();
     let lines: Vec<String> = game
-        .alive_indices()
+        .sheriff_eligible_indices()
         .into_iter()
         .map(|i| {
-            let status = if candidates.contains(&i) {
-                "🎖️ 候选人，无需投票"
+            let status = if game.sheriff_original_candidates.contains(&i) {
+                if candidates.contains(&i) {
+                    "🎖️ 候选人，无需投票"
+                } else if game
+                    .sheriff_withdrawals
+                    .iter()
+                    .any(|(candidate, stay)| *candidate == i && !*stay)
+                {
+                    "↩️ 已退水，无投票权"
+                } else {
+                    "⏹️ 警上出局，无投票权"
+                }
             } else if game.sheriff_votes.for_voter(i).is_some() {
                 "✅ 已投"
             } else {
@@ -820,6 +896,41 @@ pub fn build_sheriff_vote_progress_card(game: &WolfGame) -> Value {
         ),
         vec![markdown(&lines.join("\n")), note("仅显示投票状态，不公开票型")],
     )
+}
+
+pub fn build_sheriff_result_card(game: &WolfGame) -> Value {
+    let outcome = if game.stage == Stage::SheriffSpeech && game.sheriff_vote_round == 1 {
+        let names = game
+            .sheriff_pk_candidates
+            .iter()
+            .map(|idx| display_name(&game.players[*idx]))
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("🤝 首轮平票，{} 进入 PK 发言。", names)
+    } else if let Some(sheriff) = game.sheriff_idx {
+        format!("🎖️ {} 当选警长。", display_name(&game.players[sheriff]))
+    } else {
+        "本局没有产生警长。".to_string()
+    };
+    let vote_lines = game
+        .sheriff_votes
+        .votes
+        .iter()
+        .map(|(voter, target)| match target {
+            Some(target) => format!(
+                "• {} → {}",
+                display_name(&game.players[*voter]),
+                display_name(&game.players[*target])
+            ),
+            None => format!("• {} → 弃权", display_name(&game.players[*voter])),
+        })
+        .collect::<Vec<_>>();
+    let mut elements = vec![markdown(&outcome)];
+    if !vote_lines.is_empty() {
+        elements.push(hr());
+        elements.push(markdown(&vote_lines.join("\n")));
+    }
+    card(header("🎖️ 警长竞选结果", "yellow"), elements)
 }
 
 // ============================================================================
@@ -900,7 +1011,7 @@ pub fn build_speech_private_card(
     let submit_v = merge(&v_base, &json!({ "action": submit_action }));
     let skip_v = merge(&v_base, &json!({ "action": skip_action }));
 
-    let elements = vec![
+    let mut elements = vec![
         markdown("🎤 **轮到你发言**——直接说你的内容，或选择沉默。"),
         form(
             &format!("speech_form_{}_{}", game.game_count, game.day),
@@ -912,8 +1023,11 @@ pub fn build_speech_private_card(
                 ]),
             ],
         ),
-        note("仅你可见 · 提交即结束你的回合 · 200 字内"),
     ];
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
+    elements.push(note("仅你可见 · 提交即结束你的回合 · 200 字内"));
     card(header(title, template), elements)
 }
 
@@ -929,25 +1043,29 @@ pub fn build_sheriff_direction_card(game: &WolfGame, viewer: &Player) -> Value {
     });
     let up = merge(&v_base, &json!({ "action": "wolf_sheriff_dir_up" }));
     let down = merge(&v_base, &json!({ "action": "wolf_sheriff_dir_down" }));
+    let mut elements = vec![
+        markdown(
+            "你当选了警长。请决定白天发言起手方向：\n\
+             - **警上 (顺时针)**：从你**右手第一位**起开始发言\n\
+             - **警下 (逆时针)**：从你**左手第一位**起开始发言\n\n\
+             你本人将**最后**发言（归票）。",
+        ),
+        actions(vec![
+            button("🔁 警上", up, "primary_filled"),
+            button("🔃 警下", down, "primary"),
+        ]),
+    ];
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
+    elements.push(note("仅你可见"));
     card(
         header_with_subtitle(
             "🎖️ 警长决定方向",
             "你将末位归票",
             "yellow",
         ),
-        vec![
-            markdown(
-                "你当选了警长。请决定白天发言起手方向：\n\
-                 - **警上 (顺时针)**：从你**右手第一位**起开始发言\n\
-                 - **警下 (逆时针)**：从你**左手第一位**起开始发言\n\n\
-                 你本人将**最后**发言（归票）。",
-            ),
-            actions(vec![
-                button("🔁 警上", up, "primary_filled"),
-                button("🔃 警下", down, "primary"),
-            ]),
-            note("仅你可见"),
-        ],
+        elements,
     )
 }
 
@@ -1045,11 +1163,14 @@ pub fn build_last_words_private_card(game: &WolfGame, viewer: &Player) -> Value 
 // ============================================================================
 
 pub fn build_vote_card(game: &WolfGame, viewer: &Player) -> Value {
+    let candidates = game.day_vote_candidates();
     let targets: Vec<(usize, &Player)> = game
         .players
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.alive && p.open_id != viewer.open_id)
+        .filter(|(idx, p)| {
+            p.alive && p.open_id != viewer.open_id && candidates.contains(idx)
+        })
         .collect();
 
     let mut elements: Vec<Value> = vec![markdown(&format!(
@@ -1076,6 +1197,9 @@ pub fn build_vote_card(game: &WolfGame, viewer: &Player) -> Value {
         "action": "wolf_vote_abstain",
     });
     elements.push(actions(vec![button("弃权", v_abs, "default")]));
+    if let Some(explode) = self_explode_action(game, viewer) {
+        elements.push(explode);
+    }
     elements.push(note("仅你可见 · 投错也救不了"));
 
     card(
@@ -1090,8 +1214,8 @@ pub fn build_vote_card(game: &WolfGame, viewer: &Player) -> Value {
 
 /// 白天放逐投票的公开进度。只展示是否完成，不泄露投票目标或是否弃权。
 pub fn build_day_vote_progress_card(game: &WolfGame) -> Value {
-    let alive = game.alive_indices();
-    let voted = alive
+    let voters = game.day_voters();
+    let voted = voters
         .iter()
         .filter(|i| game.day_votes.for_voter(**i).is_some())
         .count();
@@ -1102,6 +1226,8 @@ pub fn build_day_vote_progress_card(game: &WolfGame) -> Value {
         .map(|(i, player)| {
             let status = if !player.alive {
                 "☠️ 已出局，无需投票"
+            } else if !voters.contains(&i) {
+                "⚖️ PK 候选人，无需投票"
             } else if game.day_votes.for_voter(i).is_some() {
                 "✅ 已投"
             } else {
@@ -1114,7 +1240,7 @@ pub fn build_day_vote_progress_card(game: &WolfGame) -> Value {
     card(
         header_with_subtitle(
             "🗳️ 投票进度",
-            &format!("第 {} 天 · {voted}/{} 已完成", game.day, alive.len()),
+            &format!("第 {} 天 · {voted}/{} 已完成", game.day, voters.len()),
             "blue",
         ),
         vec![markdown(&lines.join("\n")), note("仅显示投票状态，不公开票型")],
@@ -1141,7 +1267,11 @@ pub fn build_vote_tally_card(game: &WolfGame) -> Value {
             "🪦 {} 被投票放逐。",
             display_name(&game.players[idx])
         ),
-        None => "🤝 平票或全员弃权，无人放逐。".into(),
+        None if game.stage == Stage::DaySpeech && game.day_vote_round == 1 => {
+            "🤝 首轮平票，进入 PK 发言。".into()
+        }
+        None if game.day_vote_round == 1 => "🤝 PK 再次平票，无人放逐。".into(),
+        None => "全员弃权，无人放逐。".into(),
     };
 
     let mut elements = vec![markdown(&outcome)];
@@ -1153,6 +1283,16 @@ pub fn build_vote_tally_card(game: &WolfGame) -> Value {
     card(
         header(&format!("🗳️ 第 {} 天 · 投票结果", game.day), "blue"),
         elements,
+    )
+}
+
+pub fn build_self_explode_announce_card(player: &Player) -> Value {
+    card(
+        header("💥 狼人自爆", "carmine"),
+        vec![markdown(&format!(
+            "{} 公开自爆，当前白天流程立即结束。",
+            display_name(player)
+        ))],
     )
 }
 
@@ -1374,10 +1514,12 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
             }
             E::SheriffCandidates { .. }
             | E::SheriffSpeech { .. }
+            | E::SheriffVoteRound { .. }
             | E::SheriffElected { .. }
             | E::SheriffDirection { .. } => Section::Sheriff,
             E::DaySpeech { day, .. } => Section::DaySpeech(*day),
             E::DayVoteCast { day, .. }
+            | E::DayVoteRound { day, .. }
             | E::DayLynch { day, .. }
             | E::Death { day, night: false, .. }
             | E::LastWords { day, night: false, .. } => Section::DayVote(*day),
@@ -1458,6 +1600,17 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
                 E::SheriffSpeech { player, text } => {
                     format!("  🎤 **{}** (上警发言)：{}", name(*player), text)
                 }
+                E::SheriffVoteRound { round, votes } => {
+                    let ballots = votes
+                        .iter()
+                        .map(|(voter, target)| match target {
+                            Some(target) => format!("{} → {}", name(*voter), name(*target)),
+                            None => format!("{} → 弃权", name(*voter)),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    format!("  第 {} 轮警长票型：{}", round, ballots)
+                }
                 E::SheriffElected { player } => match player {
                     Some(p) => format!("  🎖️ **{}** 当选警长", name(*p)),
                     None => "  ⚠️ 流局，本局无警长".into(),
@@ -1478,6 +1631,9 @@ fn render_recap(game: &WolfGame) -> Vec<String> {
                     };
                     let w_marker = if *weight == 3 { " (警徽 ×1.5)" } else { "" };
                     format!("  {} {}{}", name(*voter), arrow, w_marker)
+                }
+                E::DayVoteRound { round, .. } => {
+                    format!("  第 {} 轮票型公开", round)
                 }
                 E::DayLynch { target, .. } => match target {
                     Some(t) => format!("  🪦 **{}** 被放逐", name(*t)),
@@ -1548,6 +1704,16 @@ mod tests {
     }
 
     #[test]
+    fn night_progress_is_complete_before_sheriff_nomination() {
+        let mut game = voting_game();
+        game.stage = Stage::SheriffNominate;
+
+        let encoded = build_night_progress_card(&game).to_string();
+        assert!(encoded.contains("3/3 已处理"));
+        assert!(!encoded.contains("等待行动提交"));
+    }
+
+    #[test]
     fn wolf_private_progress_shows_selected_and_confirmed_counts() {
         let mut game = voting_game();
         game.day = 2;
@@ -1605,6 +1771,7 @@ mod tests {
         let mut game = voting_game();
         game.stage = Stage::SheriffVote;
         game.sheriff_nominations = vec![(0, true), (1, false), (2, false)];
+        game.sheriff_original_candidates = vec![0];
         game.cast_sheriff_vote("p2", Some("p1")).unwrap();
 
         let encoded = build_sheriff_vote_progress_card(&game).to_string();
@@ -1615,5 +1782,22 @@ mod tests {
         assert!(!encoded.contains('→'));
         assert!(!encoded.contains("弃权"));
         assert!(!encoded.contains("wolf_sheriff_vote"));
+    }
+
+    #[test]
+    fn lynch_result_does_not_reveal_the_role() {
+        let mut game = voting_game();
+        game.players[0].role = Some(Role::Werewolf);
+        game.players[1].role = Some(Role::Villager);
+        game.players[2].role = Some(Role::Seer);
+        game.stage = Stage::DayVote;
+        game.cast_vote("p1", Some("p2")).unwrap();
+        assert_eq!(game.resolve_lynch().unwrap(), Some(1));
+
+        let encoded = build_vote_tally_card(&game).to_string();
+        assert!(encoded.contains("p2"), "真人应以 @-mention 显示");
+        assert!(!encoded.contains("狼人"));
+        assert!(!encoded.contains("村民"));
+        assert!(!encoded.contains("预言家"));
     }
 }
