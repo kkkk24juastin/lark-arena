@@ -10,8 +10,8 @@
 //!
 //! 所有决策走同一个 `LlmClient::chat_json` 入口；构造 prompt 和解析输出在这里完成。
 
-use crate::persona::Persona;
 use crate::llm::LlmClient;
+use crate::persona::Persona;
 use crate::util::{FastHashMap, FoldHashSet};
 use crate::werewolf::game::*;
 use anyhow::{Context, Result};
@@ -591,7 +591,7 @@ pub async fn wolf_pick(
     );
 
     match chat_with_history(llm, system, user, history).await {
-        Ok(content) => match sonic_rs::from_str::<WolfPickResp>(&content) {
+        Ok(content) => match parse_or_err::<WolfPickResp>(&content) {
             Ok(r) => {
                 let target_idx = if candidates.iter().any(|(i, _)| *i == r.target_idx) {
                     r.target_idx
@@ -679,7 +679,7 @@ pub async fn seer_pick(
     );
 
     match chat_with_history(llm, system, user, history).await {
-        Ok(content) => match sonic_rs::from_str::<SeerCheckResp>(&content) {
+        Ok(content) => match parse_or_err::<SeerCheckResp>(&content) {
             Ok(r) => {
                 let target = if candidates.iter().any(|(i, _)| *i == r.target_idx) {
                     r.target_idx
@@ -772,7 +772,7 @@ pub async fn witch_decide(
             return (WitchDecision::Skip, None);
         }
     };
-    let parsed: WitchResp = match sonic_rs::from_str(&raw) {
+    let parsed: WitchResp = match parse_or_err(&raw) {
         Ok(r) => r,
         Err(e) => {
             warn!(?e, content = %raw, "witch JSON parse failed");
@@ -870,7 +870,7 @@ pub async fn vote_pick(
             return (VoteDecision { target_idx: None }, None);
         }
     };
-    let parsed: VoteResp = match sonic_rs::from_str(&raw) {
+    let parsed: VoteResp = match parse_or_err(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "vote JSON parse failed");
@@ -949,7 +949,7 @@ pub async fn hunter_pick(
             return (None, None);
         }
     };
-    let parsed: HunterResp = match sonic_rs::from_str(&raw) {
+    let parsed: HunterResp = match parse_or_err(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "hunter JSON parse failed");
@@ -1026,7 +1026,7 @@ pub async fn guard_pick(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match sonic_rs::from_str::<GuardResp>(&c) {
+        Ok(c) => match parse_or_err::<GuardResp>(&c) {
             Ok(r) if candidates.iter().any(|(i, _)| *i == r.target_idx) => {
                 (r.target_idx, norm_thinking(r.thinking))
             }
@@ -1071,7 +1071,7 @@ pub async fn sheriff_run(llm: &LlmClient, view: &PublicView<'_>) -> (bool, Optio
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match sonic_rs::from_str::<SheriffRunResp>(&c) {
+        Ok(c) => match parse_or_err::<SheriffRunResp>(&c) {
             Ok(r) => (r.run, norm_thinking(r.thinking)),
             Err(e) => {
                 warn!(?e, content = %c, "sheriff_run JSON parse failed");
@@ -1129,7 +1129,7 @@ pub async fn sheriff_vote(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match sonic_rs::from_str::<SheriffVoteResp>(&c) {
+        Ok(c) => match parse_or_err::<SheriffVoteResp>(&c) {
             Ok(r) => {
                 let target = if r.target_idx >= 0 {
                     let idx = r.target_idx as usize;
@@ -1200,7 +1200,7 @@ pub async fn badge_pass(
         cands.join("\n"),
     );
     match chat_with_history(llm, system, user, history).await {
-        Ok(c) => match sonic_rs::from_str::<BadgeResp>(&c) {
+        Ok(c) => match parse_or_err::<BadgeResp>(&c) {
             Ok(r) => {
                 let target = if r.target_idx >= 0 {
                     let idx = r.target_idx as usize;
@@ -1255,7 +1255,7 @@ pub async fn sheriff_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, 
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
+        Ok(c) => match parse_or_err::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1307,7 +1307,7 @@ pub async fn sheriff_direction(llm: &LlmClient, view: &PublicView<'_>) -> (bool,
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match sonic_rs::from_str::<DirResp>(&c) {
+        Ok(c) => match parse_or_err::<DirResp>(&c) {
             Ok(r) => (r.clockwise, norm_thinking(r.thinking)),
             Err(_) => (true, None), // 默认警上
         },
@@ -1338,7 +1338,7 @@ pub async fn last_words(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
+        Ok(c) => match parse_or_err::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1440,7 +1440,7 @@ pub async fn dying_hunter_combined(
             );
         }
     };
-    let parsed: DyingShooterResp = match sonic_rs::from_str(&raw) {
+    let parsed: DyingShooterResp = match parse_or_err(&raw) {
         Ok(v) => v,
         Err(e) => {
             warn!(?e, content = %raw, "dying_hunter_combined JSON parse failed");
@@ -1495,7 +1495,7 @@ pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
     );
     let user = view.render();
     match llm.chat_json(&system, &user).await {
-        Ok(c) => match sonic_rs::from_str::<SpeechResp>(&c) {
+        Ok(c) => match parse_or_err::<SpeechResp>(&c) {
             Ok(r) => {
                 let thinking = norm_thinking(r.thinking.clone());
                 let speech = r
@@ -1519,11 +1519,28 @@ pub async fn day_speech(llm: &LlmClient, view: &PublicView<'_>) -> (String, Opti
     }
 }
 
+/// 部分 OpenAI-compatible 模型即使被要求只返回 JSON，仍会包一层 markdown
+/// 代码围栏。统一在这里解包，避免每种角色各自降级为默认动作。
+fn json_payload(s: &str) -> &str {
+    let trimmed = s.trim();
+    let Some(after_opening) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((language, body)) = after_opening.split_once('\n') else {
+        return trimmed;
+    };
+    if !language.trim().is_empty() && !language.trim().eq_ignore_ascii_case("json") {
+        return trimmed;
+    }
+    body.trim_end()
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(trimmed)
+}
 
-/// 把 (potentially) failed JSON parse into anyhow context for fmt'ing.
-#[allow(dead_code)]
 fn parse_or_err<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T> {
-    sonic_rs::from_str(s).with_context(|| format!("LLM JSON: {s}"))
+    let payload = json_payload(s);
+    sonic_rs::from_str(payload).with_context(|| format!("LLM JSON: {s}"))
 }
 
 #[cfg(test)]
@@ -1547,5 +1564,20 @@ mod tests {
         let s = view.render();
         assert!(s.contains("P0"));
         assert!(s.contains("第 1 天"));
+    }
+
+    #[test]
+    fn parses_json_from_markdown_fence() {
+        let raw = "  ```json\n{\"speech\":\"继续盘逻辑\",\"thinking\":\"隐藏推理\"}\n```  ";
+        let parsed: SpeechResp = parse_or_err(raw).unwrap();
+        assert_eq!(parsed.speech.as_deref(), Some("继续盘逻辑"));
+        assert_eq!(parsed.thinking.as_deref(), Some("隐藏推理"));
+    }
+
+    #[test]
+    fn parses_unfenced_json_unchanged() {
+        let raw = "{\"speech\":\"正常发言\"}";
+        let parsed: SpeechResp = parse_or_err(raw).unwrap();
+        assert_eq!(parsed.speech.as_deref(), Some("正常发言"));
     }
 }

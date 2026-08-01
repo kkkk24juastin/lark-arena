@@ -87,6 +87,28 @@ impl Bot {
     pub fn cfg(&self) -> &Config {
         &self.cfg
     }
+
+    /// 重启后恢复持久化中的对局。推进器遇到需要真人操作的阶段会立即返回，
+    /// AI 阶段则继续运行，因此无需重置已经进行到一半的游戏。
+    pub(crate) fn resume_active_wolf_games(self: &Arc<Self>) {
+        let chat_ids: Vec<String> = self
+            .wolf_games
+            .lock()
+            .iter()
+            .filter(|(_, game)| !matches!(game.stage, Stage::Lobby | Stage::Ended))
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect();
+        if !chat_ids.is_empty() {
+            info!(rooms = chat_ids.len(), "resuming persisted wolf games");
+        }
+        for chat_id in chat_ids {
+            let bot = self.clone();
+            tokio::spawn(async move {
+                bot.advance_wolf(&chat_id).await;
+            });
+        }
+    }
+
     pub fn set_bot_open_id(&self, id: String) {
         *self.bot_open_id.lock() = Some(id);
     }

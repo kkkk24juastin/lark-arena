@@ -280,6 +280,9 @@ pub struct WolfGame {
     /// 每只狼当晚的行动卡 message_id，给 update_card 复用。
     #[serde(default)]
     pub wolf_night_msgs: Vec<(usize, String)>,
+    /// 当晚公开进度卡 message_id。只展示环节，不展示角色玩家或行动结果。
+    #[serde(default)]
+    pub night_progress_public_msg: Option<String>,
     /// 白天投票每位玩家收到的私密投票卡 message_id，给 update_card 复用——
     /// 不存的话每次 advance_wolf 进 DayVote 都会重发一张，造成投票卡刷屏。
     /// (open_id, msg_id)。每轮 day vote 开始时清空。
@@ -336,6 +339,12 @@ pub struct WolfGame {
     /// 上警阶段每位玩家是否参选：(player_idx, is_running)。
     #[serde(default)]
     pub sheriff_nominations: Vec<(usize, bool)>,
+    /// 上警选择每位真人收到的私密操作卡 message_id。
+    #[serde(default)]
+    pub sheriff_nominate_msgs: Vec<(String, String)>,
+    /// 上警选择公开进度卡 message_id。
+    #[serde(default)]
+    pub sheriff_nominate_public_msg: Option<String>,
     /// 上警投票（候选人不能投票）。
     #[serde(default)]
     pub sheriff_votes: Ballot,
@@ -394,6 +403,9 @@ pub struct WolfGame {
     /// 两次独立调用导致言行矛盾（说"我带走 4 号"但实际不开枪）。
     #[serde(default)]
     pub pending_hunter_ai_decision: Option<Option<usize>>,
+    /// 单人公开等待环节：(环节唯一 key, message_id)。
+    #[serde(default)]
+    pub stage_wait_public_msg: Option<(String, String)>,
 
     // ---- 公开行动日志 ----
     /// 给 AI 看的事件历史，自然语言一行一条。
@@ -513,6 +525,7 @@ impl WolfGame {
             wolf_chat: vec![],
             wolf_ready: vec![],
             wolf_night_msgs: vec![],
+            night_progress_public_msg: None,
             day_vote_msgs: vec![],
             day_vote_public_msg: None,
             seer_check_target: None,
@@ -536,6 +549,8 @@ impl WolfGame {
             sheriff_idx: None,
             sheriff_enabled: false,
             sheriff_nominations: vec![],
+            sheriff_nominate_msgs: vec![],
+            sheriff_nominate_public_msg: None,
             sheriff_votes: Ballot::default(),
             sheriff_vote_msgs: vec![],
             sheriff_vote_public_msg: None,
@@ -555,6 +570,7 @@ impl WolfGame {
             pending_hunter: None,
             pending_hunter_post_stage: None,
             pending_hunter_ai_decision: None,
+            stage_wait_public_msg: None,
             event_log: vec![],
             deaths: vec![],
             recap_log: vec![],
@@ -705,6 +721,7 @@ impl WolfGame {
         self.wolf_chat.clear();
         self.wolf_ready.clear();
         self.wolf_night_msgs.clear();
+        self.night_progress_public_msg = None;
         self.seer_check_target = None;
         self.witch_save_choice = None;
         self.witch_poison_target = None;
@@ -728,6 +745,8 @@ impl WolfGame {
         self.sheriff_idx = None;
         self.sheriff_enabled = has_sheriff_election(n);
         self.sheriff_nominations.clear();
+        self.sheriff_nominate_msgs.clear();
+        self.sheriff_nominate_public_msg = None;
         self.sheriff_votes.clear();
         self.sheriff_vote_msgs.clear();
         self.sheriff_vote_public_msg = None;
@@ -747,6 +766,7 @@ impl WolfGame {
         self.pending_hunter = None;
         self.pending_hunter_post_stage = None;
         self.pending_hunter_ai_decision = None;
+        self.stage_wait_public_msg = None;
         self.event_log.clear();
         self.deaths.clear();
         self.recap_log.clear();
@@ -1174,6 +1194,8 @@ impl WolfGame {
         if self.day == 1 && self.sheriff_enabled && self.sheriff_idx.is_none() {
             self.stage = Stage::SheriffNominate;
             self.sheriff_nominations.clear();
+            self.sheriff_nominate_msgs.clear();
+            self.sheriff_nominate_public_msg = None;
             return Ok(());
         }
         self.start_day_speech();
@@ -1329,6 +1351,26 @@ impl WolfGame {
         self.alive_indices().iter().all(|i| {
             self.sheriff_nominations.iter().any(|(idx, _)| idx == i)
         })
+    }
+
+    pub fn set_sheriff_nominate_msg(&mut self, open_id: &str, msg_id: String) {
+        if let Some(slot) = self
+            .sheriff_nominate_msgs
+            .iter_mut()
+            .find(|(oid, _)| oid == open_id)
+        {
+            slot.1 = msg_id;
+        } else {
+            self.sheriff_nominate_msgs
+                .push((open_id.to_string(), msg_id));
+        }
+    }
+
+    pub fn sheriff_nominate_msg(&self, open_id: &str) -> Option<&str> {
+        self.sheriff_nominate_msgs
+            .iter()
+            .find(|(oid, _)| oid == open_id)
+            .map(|(_, id)| id.as_str())
     }
 
     pub fn sheriff_candidates(&self) -> Vec<usize> {
@@ -1956,6 +1998,7 @@ impl WolfGame {
         self.wolf_chat.clear();
         self.wolf_ready.clear();
         self.wolf_night_msgs.clear();
+        self.night_progress_public_msg = None;
         self.day_vote_msgs.clear();
         self.day_vote_public_msg = None;
         self.seer_check_target = None;

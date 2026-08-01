@@ -61,6 +61,7 @@ enum SpeechKind {
 
 #[derive(Clone, Copy)]
 enum VoteProgressKind {
+    SheriffNominate,
     Sheriff,
     Day,
 }
@@ -625,6 +626,8 @@ impl Bot {
         let bot = self.clone();
         let cid = chat_id.to_string();
         tokio::spawn(async move {
+            bot.refresh_vote_progress_public(&cid, VoteProgressKind::SheriffNominate)
+                .await;
             bot.advance_wolf(&cid).await;
         });
         Ok(toast(if running { "已上警" } else { "未上警" }))
@@ -796,15 +799,45 @@ impl Bot {
     }
 
     async fn advance_wolf_inner(&self, chat_id: &str) {
-        // 防递归：上限若干次循环避免任何意外。
-        for _ in 0..50 {
-            let stage_now = {
-                let games = self.wolf_games.lock();
-                games.get(chat_id).map(|g| g.stage)
-            };
-            let Some(stage) = stage_now else { return };
+        let mut previous_state: Option<String> = None;
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            if iterations % 50 == 0 {
+                // 全 AI 或真人已出局时可能连续推进很多步，定期让出执行权，
+                // 但不能因为固定步数预算耗尽而把房间永久停住。
+                tokio::task::yield_now().await;
+            }
 
-            match stage {
+            let (stage_now, state_snapshot) = {
+                let games = self.wolf_games.lock();
+                let Some(g) = games.get(chat_id) else { return };
+                (g.stage, sonic_rs::to_string(g).ok())
+            };
+            if state_snapshot.is_some() && state_snapshot == previous_state {
+                warn!(stage = ?stage_now, %chat_id, "advance_wolf stopped because game state made no progress");
+                return;
+            }
+            previous_state = state_snapshot;
+
+            if matches!(
+                stage_now,
+                Stage::GuardPick
+                    | Stage::WolvesPick
+                    | Stage::SeerPick
+                    | Stage::WitchAct
+                    | Stage::DayReveal
+            ) {
+                self.refresh_night_progress_public(chat_id).await;
+            }
+            if matches!(
+                stage_now,
+                Stage::SheriffPickDirection | Stage::HunterShoot | Stage::BadgePass
+            ) {
+                self.refresh_single_action_progress_public(chat_id).await;
+            }
+
+            match stage_now {
                 Stage::Lobby | Stage::Ended => return,
 
                 Stage::GuardPick => {
@@ -917,7 +950,7 @@ impl Bot {
                 }
 
                 Stage::SheriffNominate => {
-                    // AI 决定是否上警 + 给人类发上警卡
+                    // 真人收卡、公开进度和 AI 选择同步开始。
                     let pending_ais: Vec<(usize, String)> = {
                         let games = self.wolf_games.lock();
                         let Some(g) = games.get(chat_id) else { return };
@@ -930,55 +963,43 @@ impl Bot {
                             .map(|i| (i, g.players[i].open_id.clone()))
                             .collect()
                     };
-                    let decisions = join_all_ordered(
-                        pending_ais
-                            .iter()
-                            .map(|(idx, _)| self.sheriff_run_ai(chat_id, *idx))
-                            .collect(),
-                    )
-                    .await;
-                    for ((_, oid), run) in pending_ais.into_iter().zip(decisions) {
-                        {
-                            let mut games = self.wolf_games.lock();
-                            if let Some(g) = games.get_mut(chat_id) {
-                                let _ = g.nominate_sheriff(&oid, run);
-                                self.persist_wolf_locked(chat_id, g);
-                            }
-                        }
-                    }
+                    let ai_choices = async {
+                        let tasks = pending_ais
+                            .into_iter()
+                            .map(|(idx, oid)| async move {
+                                let run = self.sheriff_run_ai(chat_id, idx).await;
+                                {
+                                    let mut games = self.wolf_games.lock();
+                                    if let Some(g) = games.get_mut(chat_id) {
+                                        let _ = g.nominate_sheriff(&oid, run);
+                                        self.persist_wolf_locked(chat_id, g);
+                                    }
+                                }
+                                self.refresh_vote_progress_public(
+                                    chat_id,
+                                    VoteProgressKind::SheriffNominate,
+                                )
+                                .await;
+                            })
+                            .collect();
+                        join_all_ordered(tasks).await;
+                    };
+                    let prepare_humans = async {
+                        tokio::join!(
+                            self.refresh_vote_progress_public(
+                                chat_id,
+                                VoteProgressKind::SheriffNominate
+                            ),
+                            self.ensure_sheriff_nominate_cards(chat_id),
+                        );
+                    };
+                    tokio::join!(prepare_humans, ai_choices);
 
                     let all_done = {
                         let games = self.wolf_games.lock();
                         games.get(chat_id).map(|g| g.all_alive_nominated()).unwrap_or(false)
                     };
                     if !all_done {
-                        let humans_pending: Vec<String> = {
-                            let games = self.wolf_games.lock();
-                            let Some(g) = games.get(chat_id) else { return };
-                            g.alive_indices()
-                                .into_iter()
-                                .filter(|i| {
-                                    !g.players[*i].is_ai
-                                        && !g.sheriff_nominations.iter().any(|(idx, _)| idx == i)
-                                })
-                                .map(|i| g.players[i].open_id.clone())
-                                .collect()
-                        };
-                        for oid in humans_pending {
-                            let game = {
-                                let games = self.wolf_games.lock();
-                                games.get(chat_id).cloned()
-                            };
-                            if let Some(g) = game {
-                                if let Some(p_idx) = g.find_player(&oid) {
-                                    let c = build_sheriff_nominate_card(&g, &g.players[p_idx]);
-                                    let _ = self
-                                        .client
-                                        .send_ephemeral_card(chat_id, &oid, &c)
-                                        .await;
-                                }
-                            }
-                        }
                         return;
                     }
 
@@ -2142,11 +2163,6 @@ impl Bot {
                 return;
             }
         }
-        let stuck_stage = {
-            let games = self.wolf_games.lock();
-            games.get(chat_id).map(|g| g.stage)
-        };
-        warn!(?stuck_stage, %chat_id, "advance_wolf hit iteration limit");
     }
 
     // ========================================================================
@@ -2487,7 +2503,137 @@ impl Bot {
         }
     }
 
-    /// 串行刷新公开投票进度，避免并发完成的投票互相覆盖成旧状态。
+    async fn refresh_night_progress_public(&self, chat_id: &str) {
+        let refresh_lock = {
+            let mut locks = self.wolf_vote_refresh_locks.lock();
+            locks
+                .entry(chat_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = refresh_lock.lock().await;
+        let (card_value, existing_msg, day) = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            if !matches!(
+                g.stage,
+                Stage::GuardPick
+                    | Stage::WolvesPick
+                    | Stage::SeerPick
+                    | Stage::WitchAct
+                    | Stage::DayReveal
+            ) {
+                return;
+            }
+            (
+                build_night_progress_card(g),
+                g.night_progress_public_msg.clone(),
+                g.day,
+            )
+        };
+        if let Some(msg_id) = existing_msg {
+            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
+                return;
+            }
+        }
+        match self
+            .client
+            .send_message("chat_id", chat_id, "interactive", &card_value)
+            .await
+        {
+            Ok(new_id) => {
+                let mut games = self.wolf_games.lock();
+                let Some(g) = games.get_mut(chat_id) else { return };
+                if g.day != day {
+                    return;
+                }
+                g.night_progress_public_msg = Some(new_id);
+                self.persist_wolf_locked(chat_id, g);
+            }
+            Err(e) => warn!(?e, %chat_id, "night progress card send failed"),
+        }
+    }
+
+    async fn refresh_single_action_progress_public(&self, chat_id: &str) {
+        let refresh_lock = {
+            let mut locks = self.wolf_vote_refresh_locks.lock();
+            locks
+                .entry(chat_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = refresh_lock.lock().await;
+        let (stage, key, card_value, existing_msg) = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            let (actor_idx, title, action, template) = match g.stage {
+                Stage::SheriffPickDirection => (
+                    g.sheriff_idx,
+                    "🎖️ 等待警长指示",
+                    "选择白天发言方向",
+                    "yellow",
+                ),
+                Stage::HunterShoot => (
+                    g.pending_hunter,
+                    "🏹 临死技能处理中",
+                    "决定是否发动临死技能",
+                    "carmine",
+                ),
+                Stage::BadgePass => (
+                    g.pending_badge,
+                    "🎖️ 等待警徽处理",
+                    "移交或撕毁警徽",
+                    "yellow",
+                ),
+                _ => return,
+            };
+            let Some(actor_idx) = actor_idx else { return };
+            let key = format!(
+                "{}:{}:{:?}:{}",
+                g.game_count, g.day, g.stage, actor_idx
+            );
+            let existing = g
+                .stage_wait_public_msg
+                .as_ref()
+                .filter(|(stored_key, _)| stored_key == &key)
+                .map(|(_, message_id)| message_id.clone());
+            (
+                g.stage,
+                key,
+                build_single_action_progress_card(
+                    g,
+                    title,
+                    &g.players[actor_idx],
+                    action,
+                    template,
+                ),
+                existing,
+            )
+        };
+        if let Some(msg_id) = existing_msg {
+            if self.client.update_card(&msg_id, &card_value).await.is_ok() {
+                return;
+            }
+        }
+        match self
+            .client
+            .send_message("chat_id", chat_id, "interactive", &card_value)
+            .await
+        {
+            Ok(new_id) => {
+                let mut games = self.wolf_games.lock();
+                let Some(g) = games.get_mut(chat_id) else { return };
+                if g.stage != stage {
+                    return;
+                }
+                g.stage_wait_public_msg = Some((key, new_id));
+                self.persist_wolf_locked(chat_id, g);
+            }
+            Err(e) => warn!(?e, %chat_id, "single action progress card send failed"),
+        }
+    }
+
+    /// 串行刷新公开选择进度，避免并发完成的操作互相覆盖成旧状态。
     async fn refresh_vote_progress_public(&self, chat_id: &str, kind: VoteProgressKind) {
         let refresh_lock = {
             let mut locks = self.wolf_vote_refresh_locks.lock();
@@ -2502,6 +2648,10 @@ impl Bot {
             let games = self.wolf_games.lock();
             let Some(g) = games.get(chat_id) else { return };
             match kind {
+                VoteProgressKind::SheriffNominate if g.stage == Stage::SheriffNominate => (
+                    build_sheriff_nominate_progress_card(g),
+                    g.sheriff_nominate_public_msg.clone(),
+                ),
                 VoteProgressKind::Sheriff if g.stage == Stage::SheriffVote => (
                     build_sheriff_vote_progress_card(g),
                     g.sheriff_vote_public_msg.clone(),
@@ -2529,6 +2679,11 @@ impl Bot {
                 let mut games = self.wolf_games.lock();
                 let Some(g) = games.get_mut(chat_id) else { return };
                 match kind {
+                    VoteProgressKind::SheriffNominate
+                        if g.stage == Stage::SheriffNominate =>
+                    {
+                        g.sheriff_nominate_public_msg = Some(new_id);
+                    }
                     VoteProgressKind::Sheriff if g.stage == Stage::SheriffVote => {
                         g.sheriff_vote_public_msg = Some(new_id);
                     }
@@ -2540,6 +2695,70 @@ impl Bot {
                 self.persist_wolf_locked(chat_id, g);
             }
             Err(e) => warn!(?e, %chat_id, "vote progress card send failed"),
+        }
+    }
+
+    async fn ensure_sheriff_nominate_cards(&self, chat_id: &str) {
+        let pending: Vec<(String, Value)> = {
+            let games = self.wolf_games.lock();
+            let Some(g) = games.get(chat_id) else { return };
+            if g.stage != Stage::SheriffNominate {
+                return;
+            }
+            g.alive_indices()
+                .into_iter()
+                .filter(|i| {
+                    !g.players[*i].is_ai
+                        && !g
+                            .sheriff_nominations
+                            .iter()
+                            .any(|(player, _)| player == i)
+                        && g
+                            .sheriff_nominate_msg(&g.players[*i].open_id)
+                            .is_none()
+                })
+                .map(|i| {
+                    let player = &g.players[i];
+                    (
+                        player.open_id.clone(),
+                        build_sheriff_nominate_card(g, player),
+                    )
+                })
+                .collect()
+        };
+        let results = join_all_ordered(
+            pending
+                .into_iter()
+                .map(|(open_id, card)| async move {
+                    let result = self
+                        .client
+                        .send_ephemeral_card(chat_id, &open_id, &card)
+                        .await;
+                    (open_id, result)
+                })
+                .collect(),
+        )
+        .await;
+
+        let mut games = self.wolf_games.lock();
+        let Some(g) = games.get_mut(chat_id) else { return };
+        if g.stage != Stage::SheriffNominate {
+            return;
+        }
+        let mut changed = false;
+        for (open_id, result) in results {
+            match result {
+                Ok(message_id) => {
+                    if g.sheriff_nominate_msg(&open_id).is_none() {
+                        g.set_sheriff_nominate_msg(&open_id, message_id);
+                        changed = true;
+                    }
+                }
+                Err(e) => warn!(?e, %open_id, "failed to send sheriff nominate card"),
+            }
+        }
+        if changed {
+            self.persist_wolf_locked(chat_id, g);
         }
     }
 

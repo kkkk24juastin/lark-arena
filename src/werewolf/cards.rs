@@ -164,6 +164,54 @@ pub fn build_game_start_card(game: &WolfGame) -> Value {
     )
 }
 
+/// 整晚公开进度。展示规则中已知的行动环节，但不展示对应玩家、目标或结果。
+pub fn build_night_progress_card(game: &WolfGame) -> Value {
+    let mut steps: Vec<(&str, Stage)> = vec![];
+    if game.role_idx(Role::Guard).is_some() {
+        steps.push(("守护环节", Stage::GuardPick));
+    }
+    steps.extend([
+        ("狼人环节", Stage::WolvesPick),
+        ("查验环节", Stage::SeerPick),
+        ("药剂环节", Stage::WitchAct),
+    ]);
+    let current = steps.iter().position(|(_, stage)| *stage == game.stage);
+    let all_processed = game.stage == Stage::DayReveal
+        || (game.stage == Stage::LastWords
+            && game.last_words_post_stage == Some(Stage::DayReveal));
+    let processed = if all_processed {
+        steps.len()
+    } else {
+        current.unwrap_or(0)
+    };
+    let lines: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let status = if all_processed || i < processed {
+                "✅ 已处理"
+            } else if Some(i) == current {
+                "⏳ 进行中"
+            } else {
+                "· 等待中"
+            };
+            format!("• {label} · {status}")
+        })
+        .collect();
+
+    card(
+        header_with_subtitle(
+            &format!("🌒 第 {} 夜 · 行动进度", game.day),
+            &format!("{processed}/{} 已处理", steps.len()),
+            "purple",
+        ),
+        vec![
+            markdown(&lines.join("\n")),
+            note("仅显示环节进度，不公开角色玩家、行动目标或结果"),
+        ],
+    )
+}
+
 // ============================================================================
 // 夜晚 - 守卫
 // ============================================================================
@@ -581,6 +629,67 @@ pub fn build_sheriff_nominate_card(game: &WolfGame, viewer: &Player) -> Value {
             ),
             actions(buttons),
             note("仅你可见"),
+        ],
+    )
+}
+
+/// 上警选择公开进度。只展示是否完成选择，不提前公开是否参选。
+pub fn build_sheriff_nominate_progress_card(game: &WolfGame) -> Value {
+    let alive = game.alive_indices();
+    let decided = alive
+        .iter()
+        .filter(|i| {
+            game.sheriff_nominations
+                .iter()
+                .any(|(player, _)| player == *i)
+        })
+        .count();
+    let lines: Vec<String> = alive
+        .iter()
+        .map(|i| {
+            let status = if game
+                .sheriff_nominations
+                .iter()
+                .any(|(player, _)| player == i)
+            {
+                "✅ 已选择"
+            } else {
+                "⏳ 未选择"
+            };
+            format!("• {} · {status}", display_name(&game.players[*i]))
+        })
+        .collect();
+
+    card(
+        header_with_subtitle(
+            "🎖️ 上警选择进度",
+            &format!("{decided}/{} 已完成", alive.len()),
+            "yellow",
+        ),
+        vec![
+            markdown(&lines.join("\n")),
+            note("仅显示是否完成选择，不提前公开是否参选"),
+        ],
+    )
+}
+
+/// 单人公开行动的等待卡。角色身份已经公开或使用中性称呼，避免泄露底牌。
+pub fn build_single_action_progress_card(
+    game: &WolfGame,
+    title: &str,
+    actor: &Player,
+    action_label: &str,
+    template: &str,
+) -> Value {
+    card(
+        header_with_subtitle(title, &format!("第 {} 天", game.day), template),
+        vec![
+            markdown(&format!(
+                "⏳ 正在等待 {} **{}**。",
+                display_name(actor),
+                action_label
+            )),
+            note("完成后会立即公布可公开的结果"),
         ],
     )
 }
@@ -1381,6 +1490,38 @@ mod tests {
         assert!(!encoded.contains('→'));
         assert!(!encoded.contains("弃权"));
         assert!(!encoded.contains("wolf_vote"));
+    }
+
+    #[test]
+    fn night_progress_shows_stages_without_player_identity() {
+        let mut game = voting_game();
+        game.day = 2;
+        game.stage = Stage::SeerPick;
+
+        let encoded = build_night_progress_card(&game).to_string();
+        assert!(encoded.contains("第 2 夜 · 行动进度"));
+        assert!(encoded.contains("1/3 已处理"));
+        assert!(encoded.contains("狼人环节"));
+        assert!(encoded.contains("查验环节"));
+        assert!(!encoded.contains("玩家一"));
+        assert!(!encoded.contains("玩家二"));
+        assert!(!encoded.contains("玩家三"));
+    }
+
+    #[test]
+    fn sheriff_nominate_progress_hides_the_choice() {
+        let mut game = voting_game();
+        game.stage = Stage::SheriffNominate;
+        game.nominate_sheriff("p1", true).unwrap();
+        game.nominate_sheriff("p2", false).unwrap();
+
+        let encoded = build_sheriff_nominate_progress_card(&game).to_string();
+        assert!(encoded.contains("2/3 已完成"));
+        assert!(encoded.contains("✅ 已选择"));
+        assert!(encoded.contains("⏳ 未选择"));
+        assert!(!encoded.contains("已上警"));
+        assert!(!encoded.contains("未上警"));
+        assert!(!encoded.contains("wolf_sheriff_run"));
     }
 
     #[test]

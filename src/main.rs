@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    bot.resume_active_wolf_games();
     server::run(bot, &bind_addr).await
 }
 
