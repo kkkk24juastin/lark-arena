@@ -189,11 +189,34 @@ pub fn build_night_progress_card(game: &WolfGame) -> Value {
         .enumerate()
         .map(|(i, (label, _))| {
             let status = if all_processed || i < processed {
-                "✅ 已处理"
+                "✅ 已处理".to_string()
             } else if Some(i) == current {
-                "⏳ 进行中"
+                match game.stage {
+                    Stage::WolvesPick => {
+                        let alive_wolves = game.alive_wolves();
+                        let selected = alive_wolves
+                            .iter()
+                            .filter(|wolf| {
+                                game.wolf_kill_votes
+                                    .iter()
+                                    .any(|(voter, _)| voter == *wolf)
+                            })
+                            .count();
+                        if selected == 0 {
+                            "⏳ 等待行动提交".to_string()
+                        } else if selected < alive_wolves.len() {
+                            "⏳ 行动陆续提交中".to_string()
+                        } else {
+                            "⏳ 正在汇总决策".to_string()
+                        }
+                    }
+                    Stage::GuardPick | Stage::SeerPick | Stage::WitchAct => {
+                        "⏳ 等待行动提交".to_string()
+                    }
+                    _ => "⏳ 进行中".to_string(),
+                }
             } else {
-                "· 等待中"
+                "· 等待中".to_string()
             };
             format!("• {label} · {status}")
         })
@@ -283,6 +306,18 @@ pub fn build_wolf_night_card(game: &WolfGame, viewer: &Player) -> Value {
 
     // 1. 全员（含自己）进度
     let alive_wolves = game.alive_wolves();
+    let selected = alive_wolves
+        .iter()
+        .filter(|wolf| {
+            game.wolf_kill_votes
+                .iter()
+                .any(|(voter, _)| voter == *wolf)
+        })
+        .count();
+    let confirmed = alive_wolves
+        .iter()
+        .filter(|wolf| game.is_wolf_ready(**wolf))
+        .count();
     let progress_lines: Vec<String> = alive_wolves
         .iter()
         .map(|w| {
@@ -299,7 +334,11 @@ pub fn build_wolf_night_card(game: &WolfGame, viewer: &Player) -> Value {
         })
         .collect();
     elements.push(markdown(&format!(
-        "**队伍进度：**\n{}",
+        "**队伍进度：已选择 {}/{} · 已确认 {}/{}**\n{}",
+        selected,
+        alive_wolves.len(),
+        confirmed,
+        alive_wolves.len(),
         progress_lines.join("\n")
     )));
 
@@ -1503,6 +1542,43 @@ mod tests {
         assert!(encoded.contains("1/3 已处理"));
         assert!(encoded.contains("狼人环节"));
         assert!(encoded.contains("查验环节"));
+        assert!(!encoded.contains("玩家一"));
+        assert!(!encoded.contains("玩家二"));
+        assert!(!encoded.contains("玩家三"));
+    }
+
+    #[test]
+    fn wolf_private_progress_shows_selected_and_confirmed_counts() {
+        let mut game = voting_game();
+        game.day = 2;
+        game.stage = Stage::WolvesPick;
+        game.players[0].role = Some(Role::Werewolf);
+        game.players[1].role = Some(Role::WolfKing);
+        game.players[2].role = Some(Role::Villager);
+        game.wolf_pick("p1", "p3").unwrap();
+        game.wolf_mark_ready("p1").unwrap();
+
+        let encoded = build_wolf_night_card(&game, &game.players[0]).to_string();
+        assert!(encoded.contains("已选择 1/2"));
+        assert!(encoded.contains("已确认 1/2"));
+        assert!(encoded.contains("玩家一"));
+        assert!(encoded.contains("玩家二"));
+        assert!(encoded.contains("玩家三"));
+    }
+
+    #[test]
+    fn wolf_public_progress_shows_activity_without_leaking_counts() {
+        let mut game = voting_game();
+        game.day = 2;
+        game.stage = Stage::WolvesPick;
+        game.players[0].role = Some(Role::Werewolf);
+        game.players[1].role = Some(Role::WolfKing);
+        game.players[2].role = Some(Role::Villager);
+        game.wolf_pick("p1", "p3").unwrap();
+
+        let encoded = build_night_progress_card(&game).to_string();
+        assert!(encoded.contains("行动陆续提交中"));
+        assert!(!encoded.contains("1/2"));
         assert!(!encoded.contains("玩家一"));
         assert!(!encoded.contains("玩家二"));
         assert!(!encoded.contains("玩家三"));

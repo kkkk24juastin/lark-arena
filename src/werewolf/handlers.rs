@@ -203,6 +203,7 @@ impl Bot {
                 let cid = chat_id.clone();
                 tokio::spawn(async move {
                     bot.broadcast_wolf_night_update(&cid).await;
+                    bot.refresh_night_progress_public(&cid).await;
                     bot.advance_wolf(&cid).await;
                 });
                 Ok(toast("已选目标 · 改主意可再点"))
@@ -257,6 +258,7 @@ impl Bot {
                 let cid = chat_id.clone();
                 tokio::spawn(async move {
                     bot.broadcast_wolf_night_update(&cid).await;
+                    bot.refresh_night_progress_public(&cid).await;
                     bot.advance_wolf(&cid).await;
                 });
                 Ok(toast("已就绪 · 等队友"))
@@ -1273,6 +1275,9 @@ impl Bot {
                                     )),
                                 }
                             }
+                            // 每只 AI 狼完成后刷新一次公开子状态，让等待中的玩家
+                            // 知道本环节仍在推进，但不公开存活狼人数或行动目标。
+                            self.refresh_night_progress_public(chat_id).await;
                             // 3 次都失败就跳过这只狼（这只狼无效投票）
                         }
                         // 直接 advance（无需"我决定了"）
@@ -1403,6 +1408,7 @@ impl Bot {
                             }
                         }
                         self.broadcast_wolf_night_update(chat_id).await;
+                        self.refresh_night_progress_public(chat_id).await;
                     }
 
                     // 检查是否所有存活狼都就绪
